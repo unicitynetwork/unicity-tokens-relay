@@ -112,7 +112,10 @@ pub struct DbWriterContext {
     pub metrics: NostrMetrics,
 }
 
-/// Spawn a database writer that persists events to the `SQLite` store.
+/// Run the database writer loop. Pulls submitted events from `event_rx`,
+/// runs validation (kind allow/blacklist, optional whitelist, NIP-05, gRPC
+/// admission, pay-to-relay), persists to the configured `NostrRepo`
+/// (SQLite or Postgres), and broadcasts saved events on `bcast_tx`.
 pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
     let DbWriterContext {
         repo,
@@ -461,9 +464,16 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
                 start.elapsed()
             );
             event_write = true;
+            metrics
+                .events_ephemeral_broadcast_by_kind
+                .with_label_values(&[&event.kind.to_string()])
+                .inc();
 
-            // send OK message. ephemeral events are broadcast but not persisted,
-            // so they intentionally do not bump events_persisted_by_kind.
+            // ephemeral events are broadcast but not persisted, so they bump
+            // events_ephemeral_broadcast_by_kind (above) instead of
+            // events_persisted_by_kind. This keeps the accounting identity
+            //   received = persisted + ephemeral_broadcast + rejected
+            // intact across all events.
             notice_tx.try_send(Notice::saved(event.id)).ok();
         } else {
             match repo.write_event(&event).await {

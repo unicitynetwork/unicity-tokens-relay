@@ -38,8 +38,9 @@ Counters for raw command frames received from clients.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `nostr_events_received_by_kind_total` | counter | `kind` | Successfully parsed events received from clients, by kind. Includes events that get rejected downstream — every increment here should match either an `events_persisted_by_kind` or an `events_rejected` increment. |
-| `nostr_events_persisted_by_kind_total` | counter | `kind` | Events successfully written to the database, by kind. Ephemeral events are *not* counted here — they are broadcast but not persisted. |
+| `nostr_events_received_by_kind_total` | counter | `kind` | Successfully parsed events received from clients, by kind. The accounting identity `received = persisted + ephemeral_broadcast + rejected` holds across all kinds (see the three counters below). |
+| `nostr_events_persisted_by_kind_total` | counter | `kind` | Events successfully written to the database, by kind. Ephemeral events (kinds in `[20000, 30000)`) are *not* counted here — see the next row. |
+| `nostr_events_ephemeral_broadcast_by_kind_total` | counter | `kind` | Ephemeral events broadcast to subscribers without being persisted, by kind. |
 | `nostr_events_rejected_total` | counter | `reason` | Events rejected before persistence. Reasons: `expired`, `future_dated`, `kind_blacklist`, `kind_allowlist`, `pubkey_not_whitelisted`, `not_admitted`, `insufficient_balance`, `pubkey_not_registered`, `admission_check_error`, `nip05_invalid`, `nip05_missing`, `nip05_error`, `grpc_denied`, `duplicate`, `write_error` |
 | `nostr_events_sent_total` | counter | `source` | Events sent to subscribers. `source` = `db` (historical query result) or `realtime` (broadcast match) |
 
