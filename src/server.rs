@@ -777,6 +777,14 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         vec!["kind"].as_slice(),
     )
     .unwrap();
+    let events_ephemeral_broadcast_by_kind = IntCounterVec::new(
+        Opts::new(
+            "nostr_events_ephemeral_broadcast_by_kind_total",
+            "Ephemeral events broadcast to subscribers (not persisted), by kind",
+        ),
+        vec!["kind"].as_slice(),
+    )
+    .unwrap();
     let events_rejected = IntCounterVec::new(
         Opts::new(
             "nostr_events_rejected_total",
@@ -824,6 +832,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(subscriptions_active.clone())).unwrap();
     registry.register(Box::new(events_received_by_kind.clone())).unwrap();
     registry.register(Box::new(events_persisted_by_kind.clone())).unwrap();
+    registry.register(Box::new(events_ephemeral_broadcast_by_kind.clone())).unwrap();
     registry.register(Box::new(events_rejected.clone())).unwrap();
     registry.register(Box::new(db_events_total.clone())).unwrap();
     registry.register(Box::new(db_events_by_kind.clone())).unwrap();
@@ -846,6 +855,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         subscriptions_active,
         events_received_by_kind,
         events_persisted_by_kind,
+        events_ephemeral_broadcast_by_kind,
         events_rejected,
         db_events_total,
         db_events_by_kind,
@@ -1620,15 +1630,22 @@ async fn nostr_server(
                                 }
                                 continue
                             }
+                            // Snapshot whether the sub-id is already registered BEFORE
+                            // calling subscribe(), since subscribe() silently replaces an
+                            // entry with the same id. running_queries.insert() returning
+                            // None is *not* a reliable proxy for "newly created" — a sub
+                            // that doesn't need historical events never put an entry in
+                            // running_queries, so on re-subscribe with new filters we'd
+                            // overcount the subscriptions_active gauge.
+                            let had_sub = conn.subscriptions().contains_key(&s.id);
                             let (abandon_query_tx, abandon_query_rx) = oneshot::channel::<()>();
                             match conn.subscribe(s.clone()) {
                                 Ok(()) => {
-                                    // when we insert, if there was a previous query running with the same name, cancel it.
-                                    // sub IDs are unique per-connection: a re-subscribe with a duplicate ID
-                                    // replaces the previous one rather than adding a new entry.
+                                    // cancel any running query for this sub id
                                     if let Some(previous_query) = running_queries.insert(s.id.clone(), abandon_query_tx) {
                                         previous_query.send(()).ok();
-                                    } else {
+                                    }
+                                    if !had_sub {
                                         lifecycle.sub_added();
                                     }
                                     if s.needs_historical_events() {
@@ -1774,6 +1791,7 @@ pub struct NostrMetrics {
     pub subscriptions_active: IntGauge, // currently active REQ subscriptions
     pub events_received_by_kind: IntCounterVec, // valid events received from clients, by kind
     pub events_persisted_by_kind: IntCounterVec, // events successfully persisted, by kind
+    pub events_ephemeral_broadcast_by_kind: IntCounterVec, // ephemeral events broadcast, by kind
     pub events_rejected: IntCounterVec, // events rejected before persistence, by reason
     pub db_events_total: IntGauge,   // estimated total events in DB
     pub db_events_by_kind: IntGaugeVec, // event count per kind in DB
