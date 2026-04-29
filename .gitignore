@@ -4,3 +4,4 @@ nostr.db-*
 justfile
 result
 **/.idea/
+CLAUDE.md
