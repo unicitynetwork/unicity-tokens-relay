@@ -86,6 +86,18 @@ pub trait NostrRepo: Send + Sync {
     /// Get the most recent invoice for a given pubkey
     /// invoice must be unpaid and not expired
     async fn get_unpaid_invoice(&self, pubkey: &Keys) -> Result<Option<InvoiceInfo>>;
+
+    /// Estimated total event count in the database
+    async fn count_events_total(&self) -> Result<i64>;
+
+    /// Event counts grouped by kind: `Vec<(kind, count)>`
+    async fn count_events_by_kind(&self) -> Result<Vec<(i64, i64)>>;
+
+    /// Distinct authors in the events table (estimate where supported)
+    async fn count_distinct_authors_estimate(&self) -> Result<i64>;
+
+    /// Database size on disk in bytes
+    async fn db_size_bytes(&self) -> Result<i64>;
 }
 
 // Current time, with a slight forward jitter in seconds

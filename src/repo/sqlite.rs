@@ -923,6 +923,51 @@ LIMIT 1;
             confirmed_at: None,
         }))
     }
+
+    async fn count_events_total(&self) -> Result<i64> {
+        let conn = self.read_pool.get()?;
+        let count = task::spawn_blocking(move || -> Result<i64> {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
+            Ok(n)
+        })
+        .await??;
+        Ok(count)
+    }
+
+    async fn count_events_by_kind(&self) -> Result<Vec<(i64, i64)>> {
+        let conn = self.read_pool.get()?;
+        let rows = task::spawn_blocking(move || -> Result<Vec<(i64, i64)>> {
+            let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM event GROUP BY kind")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await??;
+        Ok(rows)
+    }
+
+    async fn count_distinct_authors_estimate(&self) -> Result<i64> {
+        let conn = self.read_pool.get()?;
+        let count = task::spawn_blocking(move || -> Result<i64> {
+            let n: i64 =
+                conn.query_row("SELECT COUNT(DISTINCT author) FROM event", [], |r| r.get(0))?;
+            Ok(n)
+        })
+        .await??;
+        Ok(count)
+    }
+
+    async fn db_size_bytes(&self) -> Result<i64> {
+        let conn = self.read_pool.get()?;
+        let size = task::spawn_blocking(move || -> Result<i64> {
+            let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            Ok(pages * page_size)
+        })
+        .await??;
+        Ok(size)
+    }
 }
 
 /// Decide if there is an index that should be used explicitly

@@ -50,7 +50,7 @@ async-trait = "0.1.60"
 async-std = "1.12.0"
 sqlx = { version ="0.6.2", features=["runtime-tokio-rustls", "postgres", "chrono"]}
 chrono = "0.4.23"
-prometheus = "0.13.3"
+prometheus = { version = "0.13.3", features = ["process"] }
 indicatif = "0.17.3"
 bech32 = "0.9.1"
 url = "2.3.1"
