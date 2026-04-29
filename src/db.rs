@@ -98,18 +98,32 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
     repo
 }
 
+/// Wires the database writer to its inputs (event ingress, broadcast outputs,
+/// rate-limit / metrics state). Bundled into a struct so the function signature
+/// stays a single value as new dependencies are added.
+pub struct DbWriterContext {
+    pub repo: Arc<dyn NostrRepo>,
+    pub settings: Settings,
+    pub event_rx: tokio::sync::mpsc::Receiver<SubmittedEvent>,
+    pub bcast_tx: tokio::sync::broadcast::Sender<Event>,
+    pub metadata_tx: tokio::sync::broadcast::Sender<Event>,
+    pub payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
+    pub shutdown: tokio::sync::broadcast::Receiver<()>,
+    pub metrics: NostrMetrics,
+}
+
 /// Spawn a database writer that persists events to the `SQLite` store.
-#[allow(clippy::too_many_arguments)]
-pub async fn db_writer(
-    repo: Arc<dyn NostrRepo>,
-    settings: Settings,
-    mut event_rx: tokio::sync::mpsc::Receiver<SubmittedEvent>,
-    bcast_tx: tokio::sync::broadcast::Sender<Event>,
-    metadata_tx: tokio::sync::broadcast::Sender<Event>,
-    payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
-    metrics: NostrMetrics,
-) -> Result<()> {
+pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
+    let DbWriterContext {
+        repo,
+        settings,
+        mut event_rx,
+        bcast_tx,
+        metadata_tx,
+        payment_tx,
+        mut shutdown,
+        metrics,
+    } = ctx;
     // are we performing NIP-05 checking?
     let nip05_active = settings.verified_users.is_active();
     // are we requriing NIP-05 user verification?

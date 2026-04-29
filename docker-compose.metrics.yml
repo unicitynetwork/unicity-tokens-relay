@@ -38,7 +38,9 @@ services:
       - --docker_only=true
 
   alloy:
-    image: grafana/alloy:latest
+    # pin the Alloy version explicitly so this stack stays reproducible.
+    # bump deliberately when needed; do not switch to :latest.
+    image: grafana/alloy:v1.16.0
     command:
       - run
       - /etc/alloy/config.alloy
