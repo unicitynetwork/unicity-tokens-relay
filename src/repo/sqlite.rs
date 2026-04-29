@@ -925,8 +925,11 @@ LIMIT 1;
     }
 
     async fn count_events_total(&self) -> Result<i64> {
-        let conn = self.read_pool.get()?;
+        // pool.get() blocks if the pool is saturated; do it inside spawn_blocking
+        // so we don't park an async executor thread waiting for a connection.
+        let pool = self.read_pool.clone();
         let count = task::spawn_blocking(move || -> Result<i64> {
+            let conn = pool.get()?;
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
             Ok(n)
         })
@@ -935,8 +938,9 @@ LIMIT 1;
     }
 
     async fn count_events_by_kind(&self) -> Result<Vec<(i64, i64)>> {
-        let conn = self.read_pool.get()?;
+        let pool = self.read_pool.clone();
         let rows = task::spawn_blocking(move || -> Result<Vec<(i64, i64)>> {
+            let conn = pool.get()?;
             let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM event GROUP BY kind")?;
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
@@ -948,8 +952,12 @@ LIMIT 1;
     }
 
     async fn count_distinct_authors_estimate(&self) -> Result<i64> {
-        let conn = self.read_pool.get()?;
+        // SQLite has no n_distinct estimate; this runs an exact COUNT(DISTINCT).
+        // Fine for the test harness (in-memory DBs); production runs on Postgres
+        // which uses pg_stats.n_distinct. See docs/metrics.md.
+        let pool = self.read_pool.clone();
         let count = task::spawn_blocking(move || -> Result<i64> {
+            let conn = pool.get()?;
             let n: i64 =
                 conn.query_row("SELECT COUNT(DISTINCT author) FROM event", [], |r| r.get(0))?;
             Ok(n)
@@ -959,8 +967,9 @@ LIMIT 1;
     }
 
     async fn db_size_bytes(&self) -> Result<i64> {
-        let conn = self.read_pool.get()?;
+        let pool = self.read_pool.clone();
         let size = task::spawn_blocking(move || -> Result<i64> {
+            let conn = pool.get()?;
             let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
             Ok(pages * page_size)
