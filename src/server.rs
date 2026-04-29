@@ -855,7 +855,8 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     (registry, metrics)
 }
 
-async fn collect_state_metrics(repo: &dyn NostrRepo, m: &NostrMetrics) {
+/// Fast-tick collector: cheap state queries safe to run every 30s on a busy DB.
+async fn collect_fast_state_metrics(repo: &dyn NostrRepo, m: &NostrMetrics) {
     match repo.count_events_total().await {
         Ok(n) => m.db_events_total.set(n),
         Err(e) => warn!("metrics: count_events_total failed: {e}"),
@@ -868,15 +869,34 @@ async fn collect_state_metrics(repo: &dyn NostrRepo, m: &NostrMetrics) {
         Ok(n) => m.db_size_bytes.set(n),
         Err(e) => warn!("metrics: db_size_bytes failed: {e}"),
     }
+}
+
+/// Slow-tick collector: per-kind GROUP BY is a seq scan on Postgres. Run on a
+/// 10-minute cadence to keep the dashboard fresh without thrashing the buffer cache.
+async fn collect_slow_state_metrics(
+    repo: &dyn NostrRepo,
+    m: &NostrMetrics,
+    prev_kinds: &mut std::collections::HashSet<String>,
+) {
     match repo.count_events_by_kind().await {
         Ok(rows) => {
-            // reset to zero before applying current counts so kinds that vanished are dropped
-            m.db_events_by_kind.reset();
+            let mut seen = std::collections::HashSet::with_capacity(rows.len());
             for (kind, count) in rows {
+                let label = kind.to_string();
                 m.db_events_by_kind
-                    .with_label_values(&[&kind.to_string()])
+                    .with_label_values(&[&label])
                     .set(count);
+                seen.insert(label);
             }
+            // Remove labels for kinds we set previously but didn't see this cycle.
+            // Doing diff-then-remove avoids the visible scrape gap that a blanket
+            // reset() would cause.
+            for stale in prev_kinds.difference(&seen) {
+                m.db_events_by_kind
+                    .remove_label_values(&[stale.as_str()])
+                    .ok();
+            }
+            *prev_kinds = seen;
         }
         Err(e) => warn!("metrics: count_events_by_kind failed: {e}"),
     }
@@ -1000,25 +1020,40 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         ));
         info!("db writer created");
 
-        // background collector for state-of-the-database gauges
+        // background collector for state-of-the-database gauges. Two intervals:
+        //   - fast (30s): cheap queries (reltuples estimate, db size, distinct authors)
+        //   - slow (10min): per-kind GROUP BY which is a sequential scan on Postgres
         let collector_repo = repo.clone();
         let collector_metrics = metrics.clone();
         let mut collector_shutdown = invoke_shutdown.subscribe();
         tokio::task::spawn(async move {
-            let interval = Duration::from_secs(30);
-            // do a first collection pass shortly after startup, then on the interval
-            let mut tick = tokio::time::interval_at(
+            let mut fast_tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(5),
-                interval,
+                Duration::from_secs(30),
             );
+            let mut slow_tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(15),
+                Duration::from_secs(600),
+            );
+            // remember which kind labels we set last cycle, so we can drop labels
+            // for kinds that vanished without a window where the gauge is missing.
+            let mut prev_kinds: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
                 tokio::select! {
                     _ = collector_shutdown.recv() => {
                         info!("metrics collector shutting down");
                         break;
                     }
-                    _ = tick.tick() => {
-                        collect_state_metrics(collector_repo.as_ref(), &collector_metrics).await;
+                    _ = fast_tick.tick() => {
+                        collect_fast_state_metrics(collector_repo.as_ref(), &collector_metrics).await;
+                    }
+                    _ = slow_tick.tick() => {
+                        collect_slow_state_metrics(
+                            collector_repo.as_ref(),
+                            &collector_metrics,
+                            &mut prev_kinds,
+                        ).await;
                     }
                 }
             }
@@ -1294,9 +1329,10 @@ async fn nostr_server(
         cid, origin, user_agent
     );
 
-    // Measure connections
+    // Measure connections. The guard handles connections_active + per-conn
+    // subscriptions_active accounting, including panic / early-return safety.
     metrics.connections.inc();
-    metrics.connections_active.inc();
+    let lifecycle = ConnLifecycleGuard::new(metrics.clone());
 
     if settings.authorization.nip42_auth {
         conn.generate_auth_challenge();
@@ -1469,6 +1505,7 @@ async fn nostr_server(
                                 debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid, e.kind);
                                 // check if event is expired
                                 if e.is_expired() {
+                                    metrics.events_rejected.with_label_values(&["expired"]).inc();
                                     let notice = Notice::invalid(e.id, "The event has already expired");
                                     if ws_stream.send(make_notice_message(&notice)).await.is_err() {
                                         debug!("failed to send notice, closing connection (cid: {})", cid);
@@ -1489,6 +1526,7 @@ async fn nostr_server(
                                     event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
                                 } else {
+                                    metrics.events_rejected.with_label_values(&["future_dated"]).inc();
                                     info!("client: {} sent a far future-dated event", cid);
                                     if let Some(fut_sec) = settings.options.reject_future_seconds {
                                         let msg = format!("The event created_at field is out of the acceptable range (+{fut_sec}sec) for this relay.");
@@ -1591,7 +1629,7 @@ async fn nostr_server(
                                     if let Some(previous_query) = running_queries.insert(s.id.clone(), abandon_query_tx) {
                                         previous_query.send(()).ok();
                                     } else {
-                                        metrics.subscriptions_active.inc();
+                                        lifecycle.sub_added();
                                     }
                                     if s.needs_historical_events() {
                                         // start a database query.  this spawns a blocking database query on a worker thread.
@@ -1626,7 +1664,7 @@ async fn nostr_server(
                             let had_sub = conn.subscriptions().contains_key(&c.id);
                             conn.unsubscribe(&c);
                             if had_sub {
-                                metrics.subscriptions_active.dec();
+                                lifecycle.sub_removed();
                             }
                         } else {
                             info!("invalid command ignored");
@@ -1668,11 +1706,9 @@ async fn nostr_server(
     for (_, stop_tx) in running_queries {
         stop_tx.send(()).ok();
     }
-    // any subscriptions left attached to the connection are now dropped
-    metrics
-        .subscriptions_active
-        .sub(conn.subscriptions().len() as i64);
-    metrics.connections_active.dec();
+    // lifecycle guard drops here, decrementing connections_active and any
+    // remaining subscriptions_active count.
+    drop(lifecycle);
     info!(
         "stopping client connection (cid: {}, ip: {:?}, sent: {} events, recv: {} events, connected: {:?})",
         cid,
@@ -1681,6 +1717,43 @@ async fn nostr_server(
         client_received_event_count,
         orig_start.elapsed()
     );
+}
+
+/// Decrements connection and subscription gauges when dropped, so the gauges
+/// stay correct even if the connection task panics or returns early.
+struct ConnLifecycleGuard {
+    metrics: NostrMetrics,
+    held_subs: std::cell::Cell<i64>,
+}
+
+impl ConnLifecycleGuard {
+    fn new(metrics: NostrMetrics) -> Self {
+        metrics.connections_active.inc();
+        Self {
+            metrics,
+            held_subs: std::cell::Cell::new(0),
+        }
+    }
+
+    fn sub_added(&self) {
+        self.metrics.subscriptions_active.inc();
+        self.held_subs.set(self.held_subs.get() + 1);
+    }
+
+    fn sub_removed(&self) {
+        self.metrics.subscriptions_active.dec();
+        self.held_subs.set(self.held_subs.get() - 1);
+    }
+}
+
+impl Drop for ConnLifecycleGuard {
+    fn drop(&mut self) {
+        let remaining = self.held_subs.get();
+        if remaining > 0 {
+            self.metrics.subscriptions_active.sub(remaining);
+        }
+        self.metrics.connections_active.dec();
+    }
 }
 
 #[derive(Clone)]

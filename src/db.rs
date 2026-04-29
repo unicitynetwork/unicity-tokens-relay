@@ -254,6 +254,10 @@ pub async fn db_writer(
                             notice_tx
                                 .try_send(Notice::blocked(event.id, "User is not admitted"))
                                 .ok();
+                            metrics
+                                .events_rejected
+                                .with_label_values(&["not_admitted"])
+                                .inc();
                             continue;
                         }
 
@@ -264,6 +268,10 @@ pub async fn db_writer(
                             notice_tx
                                 .try_send(Notice::blocked(event.id, "Insufficient balance"))
                                 .ok();
+                            metrics
+                                .events_rejected
+                                .with_label_values(&["insufficient_balance"])
+                                .inc();
                             continue;
                         }
                         user_balance = Some(balance);
@@ -282,6 +290,10 @@ pub async fn db_writer(
                         }
                         let msg = "Pubkey not registered";
                         notice_tx.try_send(Notice::error(event.id, msg)).ok();
+                        metrics
+                            .events_rejected
+                            .with_label_values(&["pubkey_not_registered"])
+                            .inc();
                         continue;
                     }
                     Err(err) => {
@@ -289,6 +301,10 @@ pub async fn db_writer(
                         let msg = "relay experienced an error checking your admission status";
                         notice_tx.try_send(Notice::error(event.id, msg)).ok();
                         // Other error
+                        metrics
+                            .events_rejected
+                            .with_label_values(&["admission_check_error"])
+                            .inc();
                         continue;
                     }
                 }
@@ -431,12 +447,9 @@ pub async fn db_writer(
                 start.elapsed()
             );
             event_write = true;
-            metrics
-                .events_persisted_by_kind
-                .with_label_values(&[&event.kind.to_string()])
-                .inc();
 
-            // send OK message
+            // send OK message. ephemeral events are broadcast but not persisted,
+            // so they intentionally do not bump events_persisted_by_kind.
             notice_tx.try_send(Notice::saved(event.id)).ok();
         } else {
             match repo.write_event(&event).await {

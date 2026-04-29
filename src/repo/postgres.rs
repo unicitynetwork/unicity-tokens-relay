@@ -715,12 +715,18 @@ LIMIT 1;
         // pg_class.reltuples is a planner estimate maintained by ANALYZE/autovacuum.
         // It avoids a sequential scan on large tables. Negative values can occur
         // before the table has been analyzed; clamp to zero in that case.
-        let row: (Option<f32>,) =
-            sqlx::query_as("SELECT reltuples FROM pg_class WHERE relname = 'event'")
-                .fetch_optional(&self.conn)
-                .await
-                .map_err(error::Error::SqlxError)?
-                .unwrap_or((Some(0.0),));
+        // Scope by relkind ('r' = ordinary table) and namespace so we don't match
+        // toast tables, indexes, or same-named relations in another schema.
+        let row: (Option<f32>,) = sqlx::query_as(
+            "SELECT reltuples FROM pg_class \
+             WHERE relname = 'event' \
+               AND relkind = 'r' \
+               AND relnamespace = 'public'::regnamespace",
+        )
+        .fetch_optional(&self.conn)
+        .await
+        .map_err(error::Error::SqlxError)?
+        .unwrap_or((Some(0.0),));
         let est = row.0.unwrap_or(0.0).max(0.0) as i64;
         Ok(est)
     }
@@ -743,7 +749,25 @@ LIMIT 1;
         .fetch_optional(&self.conn)
         .await
         .map_err(error::Error::SqlxError)?;
-        let n_distinct = row.and_then(|r| r.0).unwrap_or(0.0);
+        let n_distinct = match row.and_then(|r| r.0) {
+            Some(v) => v,
+            None => {
+                // pg_stats is empty for this column. Most common cause: ANALYZE has
+                // not run yet on a fresh table; less common: the connecting role
+                // lacks SELECT on the table (pg_stats is privilege-filtered). Warn
+                // once so an operator sees the issue instead of a silent zero.
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "pg_stats has no row for event.pub_key; \
+                         distinct-authors metric will read 0 until ANALYZE runs \
+                         (or until the connecting role gains SELECT on event)"
+                    );
+                }
+                0.0
+            }
+        };
         if n_distinct >= 0.0 {
             Ok(n_distinct as i64)
         } else {

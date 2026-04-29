@@ -38,9 +38,9 @@ Counters for raw command frames received from clients.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `nostr_events_received_by_kind_total` | counter | `kind` | Valid events received from clients, broken down by Nostr kind |
-| `nostr_events_persisted_by_kind_total` | counter | `kind` | Events successfully persisted (or broadcast for ephemeral kinds), by kind |
-| `nostr_events_rejected_total` | counter | `reason` | Events rejected before persistence. Reasons: `kind_blacklist`, `kind_allowlist`, `pubkey_not_whitelisted`, `nip05_invalid`, `nip05_missing`, `nip05_error`, `grpc_denied`, `duplicate`, `write_error` |
+| `nostr_events_received_by_kind_total` | counter | `kind` | Successfully parsed events received from clients, by kind. Includes events that get rejected downstream — every increment here should match either an `events_persisted_by_kind` or an `events_rejected` increment. |
+| `nostr_events_persisted_by_kind_total` | counter | `kind` | Events successfully written to the database, by kind. Ephemeral events are *not* counted here — they are broadcast but not persisted. |
+| `nostr_events_rejected_total` | counter | `reason` | Events rejected before persistence. Reasons: `expired`, `future_dated`, `kind_blacklist`, `kind_allowlist`, `pubkey_not_whitelisted`, `not_admitted`, `insufficient_balance`, `pubkey_not_registered`, `admission_check_error`, `nip05_invalid`, `nip05_missing`, `nip05_error`, `grpc_denied`, `duplicate`, `write_error` |
 | `nostr_events_sent_total` | counter | `source` | Events sent to subscribers. `source` = `db` (historical query result) or `realtime` (broadcast match) |
 
 ### Latency histograms
@@ -55,7 +55,12 @@ Default Prometheus buckets (`5ms` … `10s`).
 
 ## State metrics (background-collected)
 
-A tokio task in `start_server` polls the database every 30 s (first pass 5 s after boot) and updates these gauges via `NostrRepo` trait methods. On Postgres, queries are designed to avoid sequential scans — `pg_class.reltuples` for the total estimate, `pg_stats.n_distinct` for distinct authors, `pg_database_size` for size. On SQLite they are direct counts.
+A tokio task in `start_server` polls the database on two cadences:
+
+- **Fast (every 30 s, first pass 5 s after boot)**: total events, distinct authors, DB size. On Postgres these are cheap planner-stat reads (`pg_class.reltuples`, `pg_stats.n_distinct`, `pg_database_size`); on SQLite they are direct counts.
+- **Slow (every 10 min, first pass 15 s after boot)**: per-kind event counts. The query is a `GROUP BY kind` which is a sequential scan on Postgres; running it less often keeps the buffer cache from being thrashed. The collector updates labels in-place and only removes labels for kinds that disappeared between cycles, so dashboards don't see scrape gaps.
+
+If `pg_stats` has no row for `event.pub_key` (typical right after a fresh load before `ANALYZE` has run, or if the connecting role lacks `SELECT` on the table) the distinct-authors gauge reads 0. The relay logs a one-shot warning so the operator sees the cause.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
