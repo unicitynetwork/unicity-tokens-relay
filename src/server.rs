@@ -34,6 +34,7 @@ use nostr::key::FromPkStr;
 use nostr::key::Keys;
 use prometheus::IntCounterVec;
 use prometheus::IntGauge;
+use prometheus::IntGaugeVec;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Opts, Registry, TextEncoder};
 use qrcode::render::svg;
 use qrcode::QrCode;
@@ -697,6 +698,15 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     // setup prometheus registry
     let registry = Registry::new();
 
+    // process_collector is Linux-only (procfs-backed). Production runs in Docker/ECS
+    // (Linux); this block is skipped on macOS, so /metrics omits process_* there.
+    #[cfg(target_os = "linux")]
+    registry
+        .register(Box::new(
+            prometheus::process_collector::ProcessCollector::for_self(),
+        ))
+        .unwrap();
+
     let query_sub = Histogram::with_opts(HistogramOpts::new(
         "nostr_query_seconds",
         "Subscription response times",
@@ -741,6 +751,63 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         vec!["reason"].as_slice(),
     )
     .unwrap();
+    let connections_active = IntGauge::with_opts(Opts::new(
+        "nostr_connections_active",
+        "Active WebSocket connections",
+    ))
+    .unwrap();
+    let subscriptions_active = IntGauge::with_opts(Opts::new(
+        "nostr_subscriptions_active",
+        "Active REQ subscriptions across all clients",
+    ))
+    .unwrap();
+    let events_received_by_kind = IntCounterVec::new(
+        Opts::new(
+            "nostr_events_received_by_kind_total",
+            "Valid events received from clients, by kind",
+        ),
+        vec!["kind"].as_slice(),
+    )
+    .unwrap();
+    let events_persisted_by_kind = IntCounterVec::new(
+        Opts::new(
+            "nostr_events_persisted_by_kind_total",
+            "Events successfully persisted to the database, by kind",
+        ),
+        vec!["kind"].as_slice(),
+    )
+    .unwrap();
+    let events_rejected = IntCounterVec::new(
+        Opts::new(
+            "nostr_events_rejected_total",
+            "Events rejected before persistence, by reason",
+        ),
+        vec!["reason"].as_slice(),
+    )
+    .unwrap();
+    let db_events_total = IntGauge::with_opts(Opts::new(
+        "nostr_db_events_total",
+        "Estimated total events stored in the database",
+    ))
+    .unwrap();
+    let db_events_by_kind = IntGaugeVec::new(
+        Opts::new(
+            "nostr_db_events_by_kind",
+            "Events stored in the database, by kind",
+        ),
+        vec!["kind"].as_slice(),
+    )
+    .unwrap();
+    let db_authors_distinct = IntGauge::with_opts(Opts::new(
+        "nostr_db_authors_distinct",
+        "Distinct event authors in the database (estimate)",
+    ))
+    .unwrap();
+    let db_size_bytes = IntGauge::with_opts(Opts::new(
+        "nostr_db_size_bytes",
+        "Size of the database on disk, in bytes",
+    ))
+    .unwrap();
     registry.register(Box::new(query_sub.clone())).unwrap();
     registry.register(Box::new(query_db.clone())).unwrap();
     registry.register(Box::new(write_events.clone())).unwrap();
@@ -753,6 +820,15 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(cmd_close.clone())).unwrap();
     registry.register(Box::new(cmd_auth.clone())).unwrap();
     registry.register(Box::new(disconnects.clone())).unwrap();
+    registry.register(Box::new(connections_active.clone())).unwrap();
+    registry.register(Box::new(subscriptions_active.clone())).unwrap();
+    registry.register(Box::new(events_received_by_kind.clone())).unwrap();
+    registry.register(Box::new(events_persisted_by_kind.clone())).unwrap();
+    registry.register(Box::new(events_rejected.clone())).unwrap();
+    registry.register(Box::new(db_events_total.clone())).unwrap();
+    registry.register(Box::new(db_events_by_kind.clone())).unwrap();
+    registry.register(Box::new(db_authors_distinct.clone())).unwrap();
+    registry.register(Box::new(db_size_bytes.clone())).unwrap();
     let metrics = NostrMetrics {
         query_sub,
         query_db,
@@ -766,8 +842,44 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         cmd_event,
         cmd_close,
         cmd_auth,
+        connections_active,
+        subscriptions_active,
+        events_received_by_kind,
+        events_persisted_by_kind,
+        events_rejected,
+        db_events_total,
+        db_events_by_kind,
+        db_authors_distinct,
+        db_size_bytes,
     };
     (registry, metrics)
+}
+
+async fn collect_state_metrics(repo: &dyn NostrRepo, m: &NostrMetrics) {
+    match repo.count_events_total().await {
+        Ok(n) => m.db_events_total.set(n),
+        Err(e) => warn!("metrics: count_events_total failed: {e}"),
+    }
+    match repo.count_distinct_authors_estimate().await {
+        Ok(n) => m.db_authors_distinct.set(n),
+        Err(e) => warn!("metrics: count_distinct_authors_estimate failed: {e}"),
+    }
+    match repo.db_size_bytes().await {
+        Ok(n) => m.db_size_bytes.set(n),
+        Err(e) => warn!("metrics: db_size_bytes failed: {e}"),
+    }
+    match repo.count_events_by_kind().await {
+        Ok(rows) => {
+            // reset to zero before applying current counts so kinds that vanished are dropped
+            m.db_events_by_kind.reset();
+            for (kind, count) in rows {
+                m.db_events_by_kind
+                    .with_label_values(&[&kind.to_string()])
+                    .set(count);
+            }
+        }
+        Err(e) => warn!("metrics: count_events_by_kind failed: {e}"),
+    }
 }
 
 fn file_bytes(path: &str) -> Result<Vec<u8>> {
@@ -884,8 +996,33 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
             metadata_tx.clone(),
             payment_tx.clone(),
             shutdown_listen,
+            metrics.clone(),
         ));
         info!("db writer created");
+
+        // background collector for state-of-the-database gauges
+        let collector_repo = repo.clone();
+        let collector_metrics = metrics.clone();
+        let mut collector_shutdown = invoke_shutdown.subscribe();
+        tokio::task::spawn(async move {
+            let interval = Duration::from_secs(30);
+            // do a first collection pass shortly after startup, then on the interval
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                interval,
+            );
+            loop {
+                tokio::select! {
+                    _ = collector_shutdown.recv() => {
+                        info!("metrics collector shutting down");
+                        break;
+                    }
+                    _ = tick.tick() => {
+                        collect_state_metrics(collector_repo.as_ref(), &collector_metrics).await;
+                    }
+                }
+            }
+        });
 
         // create a nip-05 verifier thread; if enabled.
         if settings.verified_users.mode != VerifiedUsersMode::Disabled {
@@ -1159,6 +1296,7 @@ async fn nostr_server(
 
     // Measure connections
     metrics.connections.inc();
+    metrics.connections_active.inc();
 
     if settings.authorization.nip42_auth {
         conn.generate_auth_challenge();
@@ -1323,6 +1461,10 @@ async fn nostr_server(
                         match parsed {
                             Ok(WrappedEvent(e)) => {
                                 metrics.cmd_event.inc();
+                                metrics
+                                    .events_received_by_kind
+                                    .with_label_values(&[&e.kind.to_string()])
+                                    .inc();
                                 let id_prefix:String = e.id.chars().take(8).collect();
                                 debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid, e.kind);
                                 // check if event is expired
@@ -1444,8 +1586,12 @@ async fn nostr_server(
                             match conn.subscribe(s.clone()) {
                                 Ok(()) => {
                                     // when we insert, if there was a previous query running with the same name, cancel it.
+                                    // sub IDs are unique per-connection: a re-subscribe with a duplicate ID
+                                    // replaces the previous one rather than adding a new entry.
                                     if let Some(previous_query) = running_queries.insert(s.id.clone(), abandon_query_tx) {
                                         previous_query.send(()).ok();
+                                    } else {
+                                        metrics.subscriptions_active.inc();
                                     }
                                     if s.needs_historical_events() {
                                         // start a database query.  this spawns a blocking database query on a worker thread.
@@ -1477,7 +1623,11 @@ async fn nostr_server(
                             }
                             // stop checking new events against
                             // the subscription
+                            let had_sub = conn.subscriptions().contains_key(&c.id);
                             conn.unsubscribe(&c);
+                            if had_sub {
+                                metrics.subscriptions_active.dec();
+                            }
                         } else {
                             info!("invalid command ignored");
                             if ws_stream.send(make_notice_message(&Notice::message("could not parse command".into()))).await.is_err() {
@@ -1518,6 +1668,11 @@ async fn nostr_server(
     for (_, stop_tx) in running_queries {
         stop_tx.send(()).ok();
     }
+    // any subscriptions left attached to the connection are now dropped
+    metrics
+        .subscriptions_active
+        .sub(conn.subscriptions().len() as i64);
+    metrics.connections_active.dec();
     info!(
         "stopping client connection (cid: {}, ip: {:?}, sent: {} events, recv: {} events, connected: {:?})",
         cid,
@@ -1542,4 +1697,13 @@ pub struct NostrMetrics {
     pub cmd_event: IntCounter,       // count of EVENT commands received
     pub cmd_close: IntCounter,       // count of CLOSE commands received
     pub cmd_auth: IntCounter,        // count of AUTH commands received
+    pub connections_active: IntGauge, // currently open WebSocket connections
+    pub subscriptions_active: IntGauge, // currently active REQ subscriptions
+    pub events_received_by_kind: IntCounterVec, // valid events received from clients, by kind
+    pub events_persisted_by_kind: IntCounterVec, // events successfully persisted, by kind
+    pub events_rejected: IntCounterVec, // events rejected before persistence, by reason
+    pub db_events_total: IntGauge,   // estimated total events in DB
+    pub db_events_by_kind: IntGaugeVec, // event count per kind in DB
+    pub db_authors_distinct: IntGauge, // distinct authors in DB (estimate)
+    pub db_size_bytes: IntGauge,     // database size on disk
 }

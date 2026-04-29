@@ -1,0 +1,31 @@
+// Scrape the relay's /metrics endpoint (Nostr-level + process_* on Linux).
+prometheus.scrape "relay" {
+  targets = [{
+    __address__ = "relay:8080",
+    job         = "nostr-rs-relay",
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Scrape cAdvisor for per-container CPU / memory / network / disk I/O.
+prometheus.scrape "cadvisor" {
+  targets = [{
+    __address__ = "cadvisor:8080",
+    job         = "cadvisor",
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Forward all scraped series to Grafana Cloud.
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_REMOTE_WRITE_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_USERNAME")
+      password = sys.env("GRAFANA_API_TOKEN")
+    }
+  }
+}

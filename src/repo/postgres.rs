@@ -710,6 +710,56 @@ LIMIT 1;
             None => Ok(None),
         }
     }
+
+    async fn count_events_total(&self) -> Result<i64> {
+        // pg_class.reltuples is a planner estimate maintained by ANALYZE/autovacuum.
+        // It avoids a sequential scan on large tables. Negative values can occur
+        // before the table has been analyzed; clamp to zero in that case.
+        let row: (Option<f32>,) =
+            sqlx::query_as("SELECT reltuples FROM pg_class WHERE relname = 'event'")
+                .fetch_optional(&self.conn)
+                .await
+                .map_err(error::Error::SqlxError)?
+                .unwrap_or((Some(0.0),));
+        let est = row.0.unwrap_or(0.0).max(0.0) as i64;
+        Ok(est)
+    }
+
+    async fn count_events_by_kind(&self) -> Result<Vec<(i64, i64)>> {
+        let rows: Vec<(i32, i64)> =
+            sqlx::query_as("SELECT kind, COUNT(*)::bigint FROM event GROUP BY kind")
+                .fetch_all(&self.conn)
+                .await
+                .map_err(error::Error::SqlxError)?;
+        Ok(rows.into_iter().map(|(k, c)| (k as i64, c)).collect())
+    }
+
+    async fn count_distinct_authors_estimate(&self) -> Result<i64> {
+        // pg_stats.n_distinct: positive = absolute distinct count;
+        // negative = fraction of total rows. Postgres maintains this via ANALYZE.
+        let row: Option<(Option<f32>,)> = sqlx::query_as(
+            "SELECT n_distinct FROM pg_stats WHERE tablename = 'event' AND attname = 'pub_key'",
+        )
+        .fetch_optional(&self.conn)
+        .await
+        .map_err(error::Error::SqlxError)?;
+        let n_distinct = row.and_then(|r| r.0).unwrap_or(0.0);
+        if n_distinct >= 0.0 {
+            Ok(n_distinct as i64)
+        } else {
+            // negative => -(fraction of total rows)
+            let total = self.count_events_total().await? as f32;
+            Ok((-n_distinct * total) as i64)
+        }
+    }
+
+    async fn db_size_bytes(&self) -> Result<i64> {
+        let (size,): (i64,) = sqlx::query_as("SELECT pg_database_size(current_database())")
+            .fetch_one(&self.conn)
+            .await
+            .map_err(error::Error::SqlxError)?;
+        Ok(size)
+    }
 }
 
 /// Create a dynamic SQL query and params from a subscription filter.

@@ -99,6 +99,7 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
 }
 
 /// Spawn a database writer that persists events to the `SQLite` store.
+#[allow(clippy::too_many_arguments)]
 pub async fn db_writer(
     repo: Arc<dyn NostrRepo>,
     settings: Settings,
@@ -107,6 +108,7 @@ pub async fn db_writer(
     metadata_tx: tokio::sync::broadcast::Sender<Event>,
     payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    metrics: NostrMetrics,
 ) -> Result<()> {
     // are we performing NIP-05 checking?
     let nip05_active = settings.verified_users.is_active();
@@ -176,6 +178,10 @@ pub async fn db_writer(
                 notice_tx
                     .try_send(Notice::blocked(event.id, "event kind is blocked by relay"))
                     .ok();
+                metrics
+                    .events_rejected
+                    .with_label_values(&["kind_blacklist"])
+                    .inc();
                 continue;
             }
         }
@@ -192,6 +198,10 @@ pub async fn db_writer(
                 notice_tx
                     .try_send(Notice::blocked(event.id, "event kind is blocked by relay"))
                     .ok();
+                metrics
+                    .events_rejected
+                    .with_label_values(&["kind_allowlist"])
+                    .inc();
                 continue;
             }
         }
@@ -217,6 +227,10 @@ pub async fn db_writer(
                             "pubkey is not allowed to publish to this relay",
                         ))
                         .ok();
+                    metrics
+                        .events_rejected
+                        .with_label_values(&["pubkey_not_whitelisted"])
+                        .inc();
                     continue;
                 }
             }
@@ -310,6 +324,10 @@ pub async fn db_writer(
                                 "NIP-05 verification is no longer valid (expired/wrong domain)",
                             ))
                             .ok();
+                        metrics
+                            .events_rejected
+                            .with_label_values(&["nip05_invalid"])
+                            .inc();
                         continue;
                     }
                 }
@@ -327,10 +345,18 @@ pub async fn db_writer(
                             "NIP-05 verification needed to publish events",
                         ))
                         .ok();
+                    metrics
+                        .events_rejected
+                        .with_label_values(&["nip05_missing"])
+                        .inc();
                     continue;
                 }
                 Err(e) => {
                     warn!("checking nip05 verification status failed: {:?}", e);
+                    metrics
+                        .events_rejected
+                        .with_label_values(&["nip05_error"])
+                        .inc();
                     continue;
                 }
             }
@@ -372,6 +398,10 @@ pub async fn db_writer(
                                 &decision.message().unwrap_or_default(),
                             ))
                             .ok();
+                        metrics
+                            .events_rejected
+                            .with_label_values(&["grpc_denied"])
+                            .inc();
                         continue;
                     }
                 }
@@ -401,6 +431,10 @@ pub async fn db_writer(
                 start.elapsed()
             );
             event_write = true;
+            metrics
+                .events_persisted_by_kind
+                .with_label_values(&[&event.kind.to_string()])
+                .inc();
 
             // send OK message
             notice_tx.try_send(Notice::saved(event.id)).ok();
@@ -410,6 +444,10 @@ pub async fn db_writer(
                     if updated == 0 {
                         trace!("ignoring duplicate or deleted event");
                         notice_tx.try_send(Notice::duplicate(event.id)).ok();
+                        metrics
+                            .events_rejected
+                            .with_label_values(&["duplicate"])
+                            .inc();
                     } else {
                         info!(
                             "persisted event: {:?} (kind: {}) from: {:?} in: {:?} (IP: {:?})",
@@ -420,6 +458,10 @@ pub async fn db_writer(
                             subm_event.source_ip,
                         );
                         event_write = true;
+                        metrics
+                            .events_persisted_by_kind
+                            .with_label_values(&[&event.kind.to_string()])
+                            .inc();
                         // send this out to all clients
                         bcast_tx.send(event.clone()).ok();
                         notice_tx.try_send(Notice::saved(event.id)).ok();
@@ -429,6 +471,10 @@ pub async fn db_writer(
                     warn!("event insert failed: {:?}", err);
                     let msg = "relay experienced an error trying to publish the latest event";
                     notice_tx.try_send(Notice::error(event.id, msg)).ok();
+                    metrics
+                        .events_rejected
+                        .with_label_values(&["write_error"])
+                        .inc();
                 }
             }
         }
