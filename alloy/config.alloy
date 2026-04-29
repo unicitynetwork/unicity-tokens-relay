@@ -8,16 +8,6 @@ prometheus.scrape "relay" {
   scrape_interval = "15s"
 }
 
-// Scrape cAdvisor for per-container CPU / memory / network / disk I/O.
-prometheus.scrape "cadvisor" {
-  targets = [{
-    __address__ = "cadvisor:8080",
-    job         = "cadvisor",
-  }]
-  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
-  scrape_interval = "15s"
-}
-
 // Forward all scraped series to Grafana Cloud.
 prometheus.remote_write "grafana_cloud" {
   endpoint {

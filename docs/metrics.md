@@ -91,7 +91,7 @@ These are sourced from `procfs` and only present on Linux. macOS dev builds will
 
 The relay does not expose machine-level CPU / RAM / disk / network — those come from sidecars:
 
-- **Container metrics** (Docker / ECS) — bundle the [`cadvisor`](https://github.com/google/cadvisor) sidecar in `docker-compose.metrics.yml`. Alloy scrapes it alongside the relay; no app changes needed. Series include `container_cpu_usage_seconds_total`, `container_memory_rss`, `container_network_*_bytes_total`, `container_fs_writes_total`, etc.
+- **Container metrics** (Fargate) — use [ECS/Fargate Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights.html). Enable it on the cluster and AWS publishes per-task and per-container CPU / memory / network / storage metrics into the `ECS/ContainerInsights` CloudWatch namespace. Cross-import to Grafana via the same CloudWatch integration as RDS (see below). cAdvisor is *not* an option in Fargate — the runtime hides `/sys`, `/var/lib/docker`, and `/dev/kmsg`, all of which cAdvisor needs to read.
 - **Bare-host metrics** (non-containerized VMs) — use `node_exporter` instead. Not bundled here; add it as another scrape target in `alloy/config.alloy` if needed.
 - **RDS database host metrics** — RDS does not allow installing exporters. Use one of:
   - **CloudWatch → Grafana Cloud**: enable the [Grafana Cloud AWS integration](https://grafana.com/docs/grafana-cloud/monitor-infrastructure/aws/cloudwatch/) to pull RDS namespace metrics (`AWS/RDS`: CPUUtilization, FreeableMemory, DatabaseConnections, FreeStorageSpace, ReadIOPS / WriteIOPS, etc.).

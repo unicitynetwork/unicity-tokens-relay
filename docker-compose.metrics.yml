@@ -1,5 +1,5 @@
 # Local stack for verifying the metrics pipeline end-to-end:
-# relay -> cAdvisor (container metrics) -> Alloy -> Grafana Cloud
+#   relay -> Alloy -> Grafana Cloud
 #
 # Required env vars (set in .env or shell):
 #   GRAFANA_REMOTE_WRITE_URL  - Prometheus remote_write endpoint
@@ -9,10 +9,11 @@
 # Usage:
 #   docker compose -f docker-compose.metrics.yml up
 #
-# In production (ECS) the relay and Alloy run as separate task definitions and
-# cAdvisor is replaced by the ECS task-level CloudWatch metrics or an Alloy
-# component scraping the ECS metadata endpoint. RDS host metrics come from
-# CloudWatch (see docs/metrics.md).
+# In production this relay runs on AWS Fargate. Container-level CPU / memory /
+# network metrics come from ECS/Fargate's built-in CloudWatch Container
+# Insights, not from cAdvisor (which can't run in Fargate — no access to
+# /sys, /var/lib/docker, or /dev/kmsg). RDS host metrics also come from
+# CloudWatch. See docs/metrics.md for the CloudWatch -> Grafana Cloud path.
 
 services:
   relay:
@@ -22,20 +23,6 @@ services:
     volumes:
       - ./config.toml:/usr/src/app/config.toml:ro
       - ./data:/usr/src/app/db
-
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
-    privileged: true
-    devices:
-      - /dev/kmsg
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-    command:
-      - --housekeeping_interval=15s
-      - --docker_only=true
 
   alloy:
     # pin the Alloy version explicitly so this stack stays reproducible.
@@ -55,4 +42,3 @@ services:
       - GRAFANA_API_TOKEN
     depends_on:
       - relay
-      - cadvisor
