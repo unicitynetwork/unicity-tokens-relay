@@ -1008,16 +1008,16 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         // start the database writer task.  Give it a channel for
         // writing events, and for publishing events that have been
         // written (to all connected clients).
-        tokio::task::spawn(db::db_writer(
-            repo.clone(),
-            settings.clone(),
+        tokio::task::spawn(db::db_writer(db::DbWriterContext {
+            repo: repo.clone(),
+            settings: settings.clone(),
             event_rx,
-            bcast_tx.clone(),
-            metadata_tx.clone(),
-            payment_tx.clone(),
-            shutdown_listen,
-            metrics.clone(),
-        ));
+            bcast_tx: bcast_tx.clone(),
+            metadata_tx: metadata_tx.clone(),
+            payment_tx: payment_tx.clone(),
+            shutdown: shutdown_listen,
+            metrics: metrics.clone(),
+        }));
         info!("db writer created");
 
         // background collector for state-of-the-database gauges. Two intervals:

@@ -967,12 +967,18 @@ LIMIT 1;
     }
 
     async fn db_size_bytes(&self) -> Result<i64> {
+        // Size of the main DB file in pages (excludes -wal / -shm sidecars in
+        // WAL mode; see docs/metrics.md). Production runs Postgres, where
+        // pg_database_size is correct.
         let pool = self.read_pool.clone();
         let size = task::spawn_blocking(move || -> Result<i64> {
             let conn = pool.get()?;
             let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-            Ok(pages * page_size)
+            // Widen through i128 so a pathological large-DB multiplication
+            // can't silently wrap. i64 caps at ~9.2 EiB, well past realistic.
+            let bytes = (pages as i128).saturating_mul(page_size as i128);
+            Ok(i64::try_from(bytes).unwrap_or(i64::MAX))
         })
         .await??;
         Ok(size)

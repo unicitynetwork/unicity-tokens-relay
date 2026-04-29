@@ -67,7 +67,7 @@ If `pg_stats` has no row for `event.pub_key` (typical right after a fresh load b
 | `nostr_db_events_total` | gauge | — | Estimated total event rows |
 | `nostr_db_events_by_kind` | gauge | `kind` | Event count per Nostr kind in the database |
 | `nostr_db_authors_distinct` | gauge | — | Distinct authors (estimate on Postgres, exact on SQLite) |
-| `nostr_db_size_bytes` | gauge | — | Database size on disk |
+| `nostr_db_size_bytes` | gauge | — | Database size. On Postgres this is `pg_database_size(current_database())`. On SQLite it is `page_count * page_size` of the **main DB file only** — the `-wal` and `-shm` sidecars (which can be substantial in WAL mode) are not included. Production runs Postgres, where this is exact. |
 | `nostr_db_connections` | gauge | — | Active DB connections in use |
 
 ## Process metrics (relay process: CPU, RSS, FDs)

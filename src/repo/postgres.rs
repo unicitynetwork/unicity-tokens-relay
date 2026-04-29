@@ -743,8 +743,13 @@ LIMIT 1;
     async fn count_distinct_authors_estimate(&self) -> Result<i64> {
         // pg_stats.n_distinct: positive = absolute distinct count;
         // negative = fraction of total rows. Postgres maintains this via ANALYZE.
+        // Schema-qualify so that an `event` table in another schema (or two
+        // matching rows from search_path overlap) can't return the wrong stats.
         let row: Option<(Option<f32>,)> = sqlx::query_as(
-            "SELECT n_distinct FROM pg_stats WHERE tablename = 'event' AND attname = 'pub_key'",
+            "SELECT n_distinct FROM pg_stats \
+             WHERE schemaname = 'public' \
+               AND tablename = 'event' \
+               AND attname = 'pub_key'",
         )
         .fetch_optional(&self.conn)
         .await
