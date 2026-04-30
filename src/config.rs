@@ -42,9 +42,12 @@ pub struct Network {
     pub port: u16,
     pub address: String,
     pub remote_ip_header: Option<String>, // retrieve client IP from this HTTP header if present
-    // Older configs used `ping_interval`; accept that name too so previously-broken
-    // configs (silently ignored due to the field-name mismatch) start taking effect.
-    #[serde(alias = "ping_interval")]
+    // The previous example config showed `ping_interval` (no `_seconds` suffix),
+    // which was always silently ignored. The canonical key is this one. We
+    // can't add a serde alias to recover the legacy name: the defaults loaded
+    // by `Config::try_from(default)` already populate `ping_interval_seconds`,
+    // so a user override of `ping_interval` ends up in the same merged map
+    // alongside it, and serde fails the deserialize with `duplicate field`.
     pub ping_interval_seconds: u32,
 }
 
@@ -247,12 +250,13 @@ impl Settings {
             settings.verified_users.is_valid(),
             "VerifiedUsers time settings could not be parsed"
         );
-        // tokio::time::interval_at panics on zero duration; reject early with a
-        // clear message instead of crashing the server after deploy.
-        assert!(
-            settings.network.ping_interval_seconds > 0,
-            "network.ping_interval_seconds must be > 0"
-        );
+        // tokio::time::interval_at panics on zero duration; surface this as a
+        // ConfigError so the caller in `Settings::new` can format it cleanly.
+        if settings.network.ping_interval_seconds == 0 {
+            return Err(ConfigError::Message(
+                "network.ping_interval_seconds must be > 0".into(),
+            ));
+        }
         // initialize durations for verified users
         settings.verified_users.init();
 

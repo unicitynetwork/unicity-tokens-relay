@@ -99,6 +99,9 @@ port = 8080
 # Set this below the idle timeout of any reverse proxy or middlebox between
 # the client and the relay. Common values: AWS ALB default 60s, Cloudflare
 # ~100s, mobile/CGNAT idle timeouts often 60–300s.
+# NOTE: an older revision of this example showed `ping_interval` (no
+# `_seconds`); that key was always silently ignored. If you copied it,
+# rename to `ping_interval_seconds`.
 #ping_interval_seconds = 45
 
 [options]
