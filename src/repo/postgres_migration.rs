@@ -334,22 +334,68 @@ CREATE TABLE "invoice" (
 /// Indexes are built `CONCURRENTLY` so the migration is safe to run
 /// against a relay with active write traffic. `CONCURRENTLY` cannot
 /// run inside a transaction, so this migration sits outside the
-/// `SimpleSqlMigration` framework: each `db.execute(&str)` call uses
-/// Postgres's simple query protocol (sqlx routes argument-less `&str`
-/// queries that way), which is what `CREATE INDEX CONCURRENTLY`
-/// requires.
+/// `SimpleSqlMigration` framework: argument-less `&str` queries are
+/// passed directly to `Executor::execute`, which sqlx routes through
+/// Postgres's simple query protocol — what `CREATE INDEX CONCURRENTLY`
+/// and `DROP INDEX CONCURRENTLY` require.
+///
+/// All work happens on a single connection guarded by a session-level
+/// `pg_advisory_lock`. This serializes concurrent startups across
+/// multiple relay instances so the cleanup phase can't race a peer's
+/// in-flight `CREATE INDEX CONCURRENTLY` (an in-progress build leaves
+/// the index marked `indisvalid = false`, which would otherwise look
+/// indistinguishable from a leftover that needs dropping).
 mod m006 {
     use crate::repo::postgres::PostgresPool;
-    use sqlx::Executor;
-    use tracing::info;
+    use sqlx::pool::PoolConnection;
+    use sqlx::{Executor, Postgres};
+    use tracing::{info, warn};
 
     pub const VERSION: i64 = 6;
 
+    /// Postgres advisory-lock key. ASCII bytes for `nosrm006`
+    /// reinterpreted as a 64-bit integer; chosen to be unlikely to
+    /// collide with any other application-level advisory lock.
+    const ADVISORY_LOCK_KEY: i64 = 0x6e6f_7372_6d30_3036_i64;
+
     pub async fn run(db: &PostgresPool) -> crate::error::Result<()> {
+        // One connection for the whole migration so the session-level
+        // lock spans every statement.
+        let mut conn = db.acquire().await?;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(ADVISORY_LOCK_KEY)
+            .execute(&mut conn)
+            .await?;
+
+        let result = run_locked(&mut conn).await;
+
+        // Always try to release the lock, even on error. If the unlock
+        // call itself fails the lock is still released when the
+        // connection is closed; warn so the operator notices.
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(ADVISORY_LOCK_KEY)
+            .execute(&mut conn)
+            .await
+        {
+            warn!(
+                "m006: failed to release advisory lock {:#x}: {e}; \
+                 lock will release when connection closes",
+                ADVISORY_LOCK_KEY
+            );
+        }
+
+        result
+    }
+
+    async fn run_locked(conn: &mut PoolConnection<Postgres>) -> crate::error::Result<()> {
+        // Re-check inside the lock — a peer instance may have just
+        // finished applying the migration while we were blocked on
+        // pg_advisory_lock.
         let applied: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM migrations WHERE serial_number = $1")
                 .bind(VERSION)
-                .fetch_one(db)
+                .fetch_one(&mut *conn)
                 .await?;
         if applied > 0 {
             return Ok(());
@@ -362,48 +408,52 @@ mod m006 {
         // namespace so a same-named index in another schema can't
         // accidentally be dropped — same convention used elsewhere in
         // this crate (see `count_events_total` / `count_distinct_authors_estimate`).
-        db.execute(
-            r#"
-DO $$
-DECLARE r RECORD;
-BEGIN
-    FOR r IN
-        SELECT c.relname
-        FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indexrelid
-        WHERE NOT i.indisvalid
-          AND c.relnamespace = 'public'::regnamespace
-          AND c.relname IN (
-              'event_pub_key_kind_created_at_idx',
-              'event_delegated_by_kind_created_at_idx'
-          )
-    LOOP
-        EXECUTE format('DROP INDEX %I', r.relname);
-    END LOOP;
-END
-$$;
-"#,
+        let leftovers: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT c.relname
+               FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE NOT i.indisvalid
+                 AND c.relnamespace = 'public'::regnamespace
+                 AND c.relname IN (
+                     'event_pub_key_kind_created_at_idx',
+                     'event_delegated_by_kind_created_at_idx'
+                 )"#,
         )
+        .fetch_all(&mut *conn)
         .await?;
 
-        info!("creating composite index event_pub_key_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
-        db.execute(
-            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_pub_key_kind_created_at_idx
-   ON "event" (pub_key, kind, created_at DESC)"#,
-        )
-        .await?;
+        for (name,) in leftovers {
+            // The relname comes from the hard-coded allow-list in the
+            // SELECT above, so format!() interpolation is safe (no
+            // untrusted input). Schema-qualify so the DROP doesn't
+            // depend on the connection's search_path.
+            let stmt = format!(r#"DROP INDEX CONCURRENTLY IF EXISTS public."{}""#, name);
+            info!("m006: dropping leftover INVALID index public.\"{}\" (CONCURRENTLY)", name);
+            // Pass &str directly so sqlx routes through the simple
+            // query protocol — CONCURRENTLY rejects extended/prepared.
+            (&mut *conn).execute(stmt.as_str()).await?;
+        }
 
-        info!("creating composite index event_delegated_by_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
-        db.execute(
-            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_delegated_by_kind_created_at_idx
-   ON "event" (delegated_by, kind, created_at DESC)
+        info!("m006: creating composite index event_pub_key_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
+        (&mut *conn)
+            .execute(
+                r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_pub_key_kind_created_at_idx
+   ON public."event" (pub_key, kind, created_at DESC)"#,
+            )
+            .await?;
+
+        info!("m006: creating composite index event_delegated_by_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
+        (&mut *conn)
+            .execute(
+                r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_delegated_by_kind_created_at_idx
+   ON public."event" (delegated_by, kind, created_at DESC)
    WHERE delegated_by IS NOT NULL"#,
-        )
-        .await?;
+            )
+            .await?;
 
         sqlx::query("INSERT INTO migrations VALUES ($1)")
             .bind(VERSION)
-            .execute(db)
+            .execute(&mut *conn)
             .await?;
 
         Ok(())
