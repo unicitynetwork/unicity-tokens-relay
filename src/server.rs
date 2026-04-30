@@ -1245,22 +1245,21 @@ fn make_notice_message(notice: &Notice) -> Message {
     Message::text(json.to_string())
 }
 
-/// Hard cap on how long a single WebSocket send can take. Without this, a
-/// dead-but-not-RST'd peer can keep `ws_stream.send().await` blocked for as
-/// long as TCP retransmits run — `tcp_retries2 * exponential backoff` ≈ 15
-/// minutes on Linux defaults — pinning the connection task and starving
-/// the ping/shutdown arms of the select loop the whole time.
-const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Send a message on the WebSocket sink with a write-side timeout. On
-/// failure, returns the disconnect-reason label for the metrics counter:
+/// Send a message on the WebSocket sink with a write-side timeout. Without
+/// the cap, a dead-but-not-RST'd peer can keep `ws_stream.send().await`
+/// blocked for as long as TCP retransmits run — `tcp_retries2 * exponential
+/// backoff` ≈ 15 minutes on Linux defaults — pinning the connection task
+/// and starving the ping/shutdown arms of the select loop the whole time.
+///
+/// On failure, returns the disconnect-reason label for the metrics counter:
 /// `"send_error"` (sink errored) or `"write_timeout"` (peer didn't drain
-/// within `WS_WRITE_TIMEOUT`).
+/// within `timeout`).
 async fn ws_send(
     ws: &mut WebSocketStream<Upgraded>,
     msg: Message,
+    timeout: Duration,
 ) -> Result<(), &'static str> {
-    match tokio::time::timeout(WS_WRITE_TIMEOUT, ws.send(msg)).await {
+    match tokio::time::timeout(timeout, ws.send(msg)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             // Preserve the underlying WsError for diagnosis — only the metric
@@ -1325,6 +1324,9 @@ async fn nostr_server(
     let mut sub_lim_opt = None;
     // 100ms jitter when the rate limiter returns
     let jitter = Jitter::up_to(Duration::from_millis(100));
+    // Per-send write timeout (validated > 0 at config load).
+    let ws_write_timeout =
+        Duration::from_secs(settings.limits.ws_write_timeout_seconds.into());
     let sub_per_min_setting = settings.limits.subscriptions_per_min;
     if let Some(sub_per_min) = sub_per_min_setting {
         if sub_per_min > 0 {
@@ -1386,6 +1388,7 @@ async fn nostr_server(
             if let Err(reason) = ws_send(
                 &mut ws_stream,
                 make_notice_message(&Notice::AuthChallenge(challenge.to_string())),
+                ws_write_timeout,
             )
             .await
             {
@@ -1413,14 +1416,14 @@ async fn nostr_server(
                     break;
                 }
                 // Send a ping
-                if let Err(reason) = ws_send(&mut ws_stream, Message::Ping(Vec::new())).await {
+                if let Err(reason) = ws_send(&mut ws_stream, Message::Ping(Vec::new()), ws_write_timeout).await {
                     debug!("failed to send ping (reason: {}), closing connection (cid: {})", reason, cid);
                     metrics.disconnects.with_label_values(&[reason]).inc();
                     break;
                 }
             },
             Some(notice_msg) = notice_rx.recv() => {
-                if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice_msg)).await {
+                if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice_msg), ws_write_timeout).await {
                     debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                     metrics.disconnects.with_label_values(&[reason]).inc();
                     break;
@@ -1431,7 +1434,7 @@ async fn nostr_server(
                 let subesc = query_result.sub_id.replace('"', "");
                 if query_result.event == "EOSE" {
                     let send_str = format!("[\"EOSE\",\"{subesc}\"]");
-                    if let Err(reason) = ws_send(&mut ws_stream, Message::Text(send_str)).await {
+                    if let Err(reason) = ws_send(&mut ws_stream, Message::Text(send_str), ws_write_timeout).await {
                         debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
                         metrics.disconnects.with_label_values(&[reason]).inc();
                         break;
@@ -1441,7 +1444,7 @@ async fn nostr_server(
                     client_received_event_count += 1;
                     // send a result
                     let send_str = format!("[\"EVENT\",\"{}\",{}]", subesc, &query_result.event);
-                    if let Err(reason) = ws_send(&mut ws_stream, Message::Text(send_str)).await {
+                    if let Err(reason) = ws_send(&mut ws_stream, Message::Text(send_str), ws_write_timeout).await {
                         debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
                         metrics.disconnects.with_label_values(&[reason]).inc();
                         break;
@@ -1486,7 +1489,7 @@ async fn nostr_server(
                                global_event.get_event_id_prefix());
                             let subesc = s.replace('"', "");
                             metrics.sent_events.with_label_values(&["realtime"]).inc();
-                            if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]"))).await {
+                            if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]")), ws_write_timeout).await {
                                 debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
                                 metrics.disconnects.with_label_values(&[reason]).inc();
                                 should_disconnect = true;
@@ -1514,6 +1517,7 @@ async fn nostr_server(
                         if let Err(reason) = ws_send(
                             &mut ws_stream,
                             make_notice_message(&Notice::message("binary messages are not accepted".into())),
+                            ws_write_timeout,
                         ).await {
                             debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                             metrics.disconnects.with_label_values(&[reason]).inc();
@@ -1530,6 +1534,7 @@ async fn nostr_server(
                         if let Err(reason) = ws_send(
                             &mut ws_stream,
                             make_notice_message(&Notice::message(format!("message too large ({size} > {max_size})"))),
+                            ws_write_timeout,
                         ).await {
                             debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                             metrics.disconnects.with_label_values(&[reason]).inc();
@@ -1580,7 +1585,7 @@ async fn nostr_server(
                                 if e.is_expired() {
                                     metrics.events_rejected.with_label_values(&["expired"]).inc();
                                     let notice = Notice::invalid(e.id, "The event has already expired");
-                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice)).await {
+                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice), ws_write_timeout).await {
                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                         break;
@@ -1604,7 +1609,7 @@ async fn nostr_server(
                                     if let Some(fut_sec) = settings.options.reject_future_seconds {
                                         let msg = format!("The event created_at field is out of the acceptable range (+{fut_sec}sec) for this relay.");
                                         let notice = Notice::invalid(e.id, &msg);
-                                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice)).await {
+                                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice), ws_write_timeout).await {
                                             debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                             metrics.disconnects.with_label_values(&[reason]).inc();
                                             break;
@@ -1631,7 +1636,7 @@ async fn nostr_server(
                                                     };
                                                     info!("client is authenticated: (cid: {}, pubkey: {:?})", cid, pubkey);
                                                     // Send OK message to confirm successful authentication (NIP-42)
-                                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::saved(event.id))).await {
+                                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::saved(event.id)), ws_write_timeout).await {
                                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                                         break;
@@ -1639,7 +1644,7 @@ async fn nostr_server(
                                                 },
                                                 Err(e) => {
                                                     info!("authentication error: {} (cid: {})", e, cid);
-                                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::restricted(event.id, format!("authentication error: {e}").as_str()))).await {
+                                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::restricted(event.id, format!("authentication error: {e}").as_str())), ws_write_timeout).await {
                                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                                         break;
@@ -1651,7 +1656,7 @@ async fn nostr_server(
                                 } else {
                                     let e = CommandUnknownError;
                                     info!("client sent an invalid event (cid: {})", cid);
-                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await {
+                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::invalid(evid, &format!("{e}"))), ws_write_timeout).await {
                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                         break;
@@ -1661,7 +1666,7 @@ async fn nostr_server(
                             Err(e) => {
                                 metrics.cmd_event.inc();
                                 info!("client sent an invalid event (cid: {})", cid);
-                                if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await {
+                                if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::invalid(evid, &format!("{e}"))), ws_write_timeout).await {
                                     debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                     metrics.disconnects.with_label_values(&[reason]).inc();
                                     break;
@@ -1686,7 +1691,7 @@ async fn nostr_server(
                             }
                             if settings.limits.limit_scrapers && s.is_scraper() {
                                 info!("subscription was scraper, ignoring (cid: {}, sub: {:?})", cid, s.id);
-                                if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EOSE\",\"{}\"]", s.id))).await {
+                                if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EOSE\",\"{}\"]", s.id)), ws_write_timeout).await {
                                     debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
                                     metrics.disconnects.with_label_values(&[reason]).inc();
                                     break;
@@ -1718,7 +1723,7 @@ async fn nostr_server(
                                 },
                                 Err(e) => {
                                     info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid, s.id);
-                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message(format!("Subscription error: {e}")))).await {
+                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message(format!("Subscription error: {e}"))), ws_write_timeout).await {
                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                         break;
@@ -1748,7 +1753,7 @@ async fn nostr_server(
                             }
                         } else {
                             info!("invalid command ignored");
-                            if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("could not parse command".into()))).await {
+                            if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("could not parse command".into())), ws_write_timeout).await {
                                 debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                                 metrics.disconnects.with_label_values(&[reason]).inc();
                                 break;
@@ -1761,7 +1766,7 @@ async fn nostr_server(
                     }
                     Err(Error::EventMaxLengthError(s)) => {
                         info!("client sent command larger ({} bytes) than max size (cid: {})", s, cid);
-                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("event exceeded max size".into()))).await {
+                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("event exceeded max size".into())), ws_write_timeout).await {
                             debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                             metrics.disconnects.with_label_values(&[reason]).inc();
                             break;
@@ -1769,7 +1774,7 @@ async fn nostr_server(
                     },
                     Err(Error::ProtoParseError) => {
                         info!("client sent command that could not be parsed (cid: {})", cid);
-                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("could not parse command".into()))).await {
+                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message("could not parse command".into())), ws_write_timeout).await {
                             debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
                             metrics.disconnects.with_label_values(&[reason]).inc();
                             break;
