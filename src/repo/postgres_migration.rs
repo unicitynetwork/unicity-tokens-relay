@@ -37,6 +37,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     run_migration(m003::migration(), db).await;
     run_migration(m004::migration(), db).await;
     run_migration(m005::migration(), db).await;
+    m006::run(db).await?;
     Ok(current_version(db).await as usize)
 }
 
@@ -316,5 +317,91 @@ CREATE TABLE "invoice" (
         "#,
             ],
         }
+    }
+}
+
+/// Add composite indexes that match the common Nostr subscription
+/// access pattern `WHERE (pub_key IN (...) OR delegated_by IN (...))
+/// AND kind IN (...) ORDER BY created_at DESC LIMIT N`.
+///
+/// Without these the planner falls back to a BitmapOr over the
+/// single-column `pub_key` / `delegated_by` indexes, fetches every
+/// matching event regardless of kind, then filters and sorts. Under
+/// load this thrashes shared buffers (`IPC:BufferIO` waits dominate)
+/// and saturates the DB pool, and stalls the relay's event loop on
+/// long DB awaits.
+///
+/// Indexes are built `CONCURRENTLY` so the migration is safe to run
+/// against a relay with active write traffic. `CONCURRENTLY` cannot
+/// run inside a transaction, so this migration sits outside the
+/// `SimpleSqlMigration` framework: each `db.execute(&str)` call uses
+/// Postgres's simple query protocol (sqlx routes argument-less `&str`
+/// queries that way), which is what `CREATE INDEX CONCURRENTLY`
+/// requires.
+mod m006 {
+    use crate::repo::postgres::PostgresPool;
+    use sqlx::Executor;
+    use tracing::info;
+
+    pub const VERSION: i64 = 6;
+
+    pub async fn run(db: &PostgresPool) -> crate::error::Result<()> {
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migrations WHERE serial_number = $1")
+                .bind(VERSION)
+                .fetch_one(db)
+                .await?;
+        if applied > 0 {
+            return Ok(());
+        }
+
+        // A previously aborted CONCURRENTLY build leaves an INVALID
+        // index behind. `CREATE INDEX IF NOT EXISTS` would then no-op
+        // and we'd be stuck with a permanently-unusable index, so drop
+        // any invalid leftovers under our names first.
+        db.execute(
+            r#"
+DO $$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.relname
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE NOT i.indisvalid
+          AND c.relname IN (
+              'event_pub_key_kind_created_at_idx',
+              'event_delegated_by_kind_created_at_idx'
+          )
+    LOOP
+        EXECUTE format('DROP INDEX %I', r.relname);
+    END LOOP;
+END
+$$;
+"#,
+        )
+        .await?;
+
+        info!("creating composite index event_pub_key_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
+        db.execute(
+            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_pub_key_kind_created_at_idx
+   ON "event" (pub_key, kind, created_at DESC)"#,
+        )
+        .await?;
+
+        info!("creating composite index event_delegated_by_kind_created_at_idx (CONCURRENTLY); this may take a while on large tables");
+        db.execute(
+            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS event_delegated_by_kind_created_at_idx
+   ON "event" (delegated_by, kind, created_at DESC)
+   WHERE delegated_by IS NOT NULL"#,
+        )
+        .await?;
+
+        sqlx::query("INSERT INTO migrations VALUES ($1)")
+            .bind(VERSION)
+            .execute(db)
+            .await?;
+
+        Ok(())
     }
 }
