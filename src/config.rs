@@ -75,6 +75,7 @@ pub struct Limits {
     pub max_event_bytes: Option<usize>, // Maximum size of an EVENT message
     pub max_ws_message_bytes: Option<usize>,
     pub max_ws_frame_bytes: Option<usize>,
+    pub ws_write_timeout_seconds: u32, // hard cap on a single ws_stream.send; prevents stuck-write zombies pinning the connection task
     pub broadcast_buffer: usize, // events to buffer for subscribers (prevents slow readers from consuming memory)
     pub event_persist_buffer: usize, // events to buffer for database commits (block senders if database writes are too slow)
     pub event_kind_blacklist: Option<Vec<u64>>,
@@ -255,6 +256,14 @@ impl Settings {
                 "network.ping_interval_seconds must be > 0".into(),
             ));
         }
+        // Same constraint for ws_write_timeout_seconds — `tokio::time::timeout`
+        // with Duration::ZERO is technically legal (always elapses immediately)
+        // but means every send disconnects, which is never the user's intent.
+        if settings.limits.ws_write_timeout_seconds == 0 {
+            return Err(ConfigError::Message(
+                "limits.ws_write_timeout_seconds must be > 0".into(),
+            ));
+        }
         // initialize durations for verified users
         settings.verified_users.init();
 
@@ -331,6 +340,12 @@ impl Default for Settings {
                 max_event_bytes: Some(2 << 17),      // 128K
                 max_ws_message_bytes: Some(2 << 17), // 128K
                 max_ws_frame_bytes: Some(2 << 17),   // 128K
+                // Bound on a single WebSocket send. 30s is generous for the
+                // 128K default message size (covers slow mobile/CGNAT clients
+                // at ~5KB/s and up). If you've raised `max_ws_message_bytes`
+                // to 1 MiB, bump this to ~60–90s to avoid timing out
+                // legitimate slow consumers.
+                ws_write_timeout_seconds: 30,
                 broadcast_buffer: 16384,
                 event_persist_buffer: 4096,
                 event_kind_blacklist: None,
@@ -457,5 +472,26 @@ ping_interval_seconds = 30
         std::fs::remove_file(&path).ok();
         let settings = result.expect("valid override should load");
         assert_eq!(settings.network.ping_interval_seconds, 30);
+    }
+
+    #[test]
+    fn rejects_zero_ws_write_timeout() {
+        let path = write_temp_config(
+            r#"
+[limits]
+ws_write_timeout_seconds = 0
+"#,
+        );
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(ConfigError::Message(msg)) => {
+                assert!(
+                    msg.contains("ws_write_timeout_seconds"),
+                    "error message should mention the offending key, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Message for zero ws write timeout, got {other:?}"),
+        }
     }
 }

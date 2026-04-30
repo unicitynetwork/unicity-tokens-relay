@@ -146,6 +146,12 @@ reject_future_seconds = 1800
 # Maximum WebSocket frame size in bytes.  Defaults to 128 KB.
 #max_ws_frame_bytes = 131072
 
+# Hard cap on a single WebSocket send, in seconds.  Default is 30, which
+# is generous for the 128 KB default message size.  If you raise
+# `max_ws_message_bytes` to 1 MiB or more, bump this to ~60–90 to avoid
+# timing out legitimate slow consumers (mobile / CGNAT clients).
+#ws_write_timeout_seconds = 30
+
 # Broadcast buffer size, in number of events.  This prevents slow
 # readers from consuming memory.
 #broadcast_buffer = 16384
