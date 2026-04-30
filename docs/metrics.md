@@ -14,7 +14,7 @@ These are updated synchronously as traffic hits the relay.
 |---|---|---|---|
 | `nostr_connections_total` | counter | — | New WebSocket connections accepted (cumulative) |
 | `nostr_connections_active` | gauge | — | Currently-open WebSocket connections |
-| `nostr_disconnects_total` | counter | `reason` | Disconnects, by cause: `shutdown`, `timeout`, `send_error`, `normal`, `error`, `broadcast_closed`. `broadcast_closed` means the broadcast sender went away (db_writer panic / relay teardown) and the connection closed because no more events would arrive. |
+| `nostr_disconnects_total` | counter | `reason` | Disconnects, by cause: `shutdown`, `timeout`, `send_error`, `write_timeout`, `normal`, `error`, `broadcast_closed`. `write_timeout` means a `ws_stream.send` exceeded the 30s write cap (peer didn't drain — usually a dead-but-not-RST'd connection that would otherwise stall the task for the full TCP retransmit window). `broadcast_closed` means the broadcast sender went away (db_writer panic / relay teardown) and the connection closed because no more events would arrive. |
 
 ### Subscription lifecycle
 
