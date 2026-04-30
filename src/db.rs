@@ -19,7 +19,6 @@ use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -543,8 +542,11 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
                         // reset last rate limit message
                         most_recent_rate_limit = Instant::now();
                     }
-                    // block event writes, allowing them to queue up
-                    thread::sleep(wait_for);
+                    // Yield instead of blocking the worker thread — db_writer is
+                    // an async task on the tokio runtime, so std::thread::sleep
+                    // would pin the whole worker (including any other tasks
+                    // sharing it) for the rate-limit window.
+                    tokio::time::sleep(wait_for).await;
                     continue;
                 }
             }
