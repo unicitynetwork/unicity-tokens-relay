@@ -1383,11 +1383,16 @@ async fn nostr_server(
     if settings.authorization.nip42_auth {
         conn.generate_auth_challenge();
         if let Some(challenge) = conn.auth_challenge() {
-            let _ = ws_send(
+            if let Err(reason) = ws_send(
                 &mut ws_stream,
                 make_notice_message(&Notice::AuthChallenge(challenge.to_string())),
             )
-            .await;
+            .await
+            {
+                debug!("failed to send AUTH challenge (reason: {}), closing connection (cid: {})", reason, cid);
+                metrics.disconnects.with_label_values(&[reason]).inc();
+                return;
+            }
         }
     }
 
@@ -1771,7 +1776,7 @@ async fn nostr_server(
                         }
                     },
                     Err(e) => {
-                        info!("got non-fatal error from client (cid: {}, error: {:?}", cid, e);
+                        info!("got non-fatal error from client (cid: {}, error: {:?})", cid, e);
                     },
                 }
             },
