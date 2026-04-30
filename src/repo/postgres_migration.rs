@@ -358,7 +358,10 @@ mod m006 {
         // A previously aborted CONCURRENTLY build leaves an INVALID
         // index behind. `CREATE INDEX IF NOT EXISTS` would then no-op
         // and we'd be stuck with a permanently-unusable index, so drop
-        // any invalid leftovers under our names first.
+        // any invalid leftovers under our names first. Scope by
+        // namespace so a same-named index in another schema can't
+        // accidentally be dropped — same convention used elsewhere in
+        // this crate (see `count_events_total` / `count_distinct_authors_estimate`).
         db.execute(
             r#"
 DO $$
@@ -369,6 +372,7 @@ BEGIN
         FROM pg_index i
         JOIN pg_class c ON c.oid = i.indexrelid
         WHERE NOT i.indisvalid
+          AND c.relnamespace = 'public'::regnamespace
           AND c.relname IN (
               'event_pub_key_kind_created_at_idx',
               'event_delegated_by_kind_created_at_idx'
