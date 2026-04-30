@@ -1,7 +1,7 @@
 //! Event persistence and querying
 //use crate::config::SETTINGS;
 use crate::config::Settings;
-use crate::db::QueryResult;
+use crate::db::{QueryResult, SLOW_THRESHOLD};
 use crate::error::{Error::SqlError, Result};
 use crate::event::{single_char_tagname, Event};
 use crate::nip05::{Nip05Name, VerificationRecord};
@@ -34,11 +34,6 @@ use nostr::key::Keys;
 pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 pub type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 pub const DB_FILE: &str = "nostr.db";
-
-/// Threshold for the `nostr_query_slow_total` counter. Mirrors the
-/// constant in the Postgres backend so the dashboard interprets the
-/// counter consistently across engines.
-const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct SqliteRepo {
@@ -105,6 +100,28 @@ impl SqliteRepo {
             write_in_progress,
             reader_threads_ready,
         }
+    }
+
+    /// Set the static `nostr_db_pool_size` gauge to the sum of all
+    /// pool ceilings. Called once at startup. Matches the
+    /// "sum across pools" approach used by the Postgres backend so
+    /// dashboards interpret the gauge consistently across engines.
+    pub fn set_pool_size_metric(&self) {
+        let total: u32 = self.read_pool.max_size()
+            + self.write_pool.max_size()
+            + self.maint_pool.max_size();
+        self.metrics.db_pool_size.set(i64::from(total));
+    }
+
+    fn pool_in_use(&self) -> u32 {
+        let pools = [&self.read_pool, &self.write_pool, &self.maint_pool];
+        pools
+            .iter()
+            .map(|p| {
+                let s = p.state();
+                s.connections.saturating_sub(s.idle_connections)
+            })
+            .sum()
     }
 
     /// Persist an event to the database, returning rows added.
@@ -388,19 +405,20 @@ impl NostrRepo for SqliteRepo {
             let mut filter_count = 0;
             // remove duplicates from the filter list.
             if let Ok(mut conn) = self.read_pool.get() {
-                {
-                    let pool_state = self.read_pool.state();
-                    metrics
-                        .db_connections
-                        .set((pool_state.connections - pool_state.idle_connections).into());
-                }
+                metrics
+                    .db_connections
+                    .set(i64::from(self.pool_in_use()));
                 for filter in sub.filters.iter() {
                     let filter_start = Instant::now();
                     filter_count += 1;
-                    let sql_gen_elapsed = filter_start.elapsed();
                     let (q, p, idx) = query_from_filter(filter);
+                    // Pre-existing bug: this measurement was previously
+                    // taken before `query_from_filter` ran, so it was
+                    // always 0. Move it after to actually capture SQL
+                    // generation time.
+                    let sql_gen_elapsed = filter_start.elapsed();
                     if sql_gen_elapsed > Duration::from_millis(10) {
-                        debug!("SQL (slow) generated in {:?}", filter_start.elapsed());
+                        debug!("SQL (slow) generated in {:?}", sql_gen_elapsed);
                     }
                     // any client that doesn't cause us to generate new rows in 2
                     // seconds gets dropped.
@@ -411,11 +429,16 @@ impl NostrRepo for SqliteRepo {
                     // make the actual SQL query (with parameters inserted) available
                     conn.trace(Some(|x| trace!("SQL trace: {:?}", x)));
                     let mut stmt = conn.prepare_cached(&q)?;
+                    // Marker for the per-filter DB-execution timer that
+                    // feeds `nostr_filter_seconds`. Mirrors the Postgres
+                    // backend so the histogram has the same meaning on
+                    // both engines (DB exec only, excluding SQL gen).
+                    let filter_query_start = Instant::now();
                     let mut event_rows = stmt.query(rusqlite::params_from_iter(p))?;
 
                     let mut first_result = true;
                     while let Some(row) = event_rows.next()? {
-                        let first_event_elapsed = filter_start.elapsed();
+                        let first_event_elapsed = filter_query_start.elapsed();
                         slow_first_event = first_event_elapsed >= slow_cutoff;
                         if first_result {
                             debug!(
@@ -512,7 +535,7 @@ impl NostrRepo for SqliteRepo {
                             .ok();
                         last_successful_send = Instant::now();
                     }
-                    let filter_elapsed = filter_start.elapsed();
+                    let filter_elapsed = filter_query_start.elapsed();
                     metrics.query_db.observe(filter_elapsed.as_secs_f64());
                     if filter_elapsed >= SLOW_THRESHOLD {
                         metrics

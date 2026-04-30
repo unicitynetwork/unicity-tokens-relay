@@ -763,7 +763,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     let query_slow_total = IntCounterVec::new(
         Opts::new(
             "nostr_query_slow_total",
-            "Database operations that exceeded the slow-query threshold (1s), by source",
+            "Database operations that exceeded the slow-query threshold, by source",
         ),
         vec!["source"].as_slice(),
     )

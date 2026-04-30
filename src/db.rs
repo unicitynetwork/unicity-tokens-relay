@@ -38,17 +38,20 @@ pub struct SubmittedEvent {
 /// Database file
 pub const DB_FILE: &str = "nostr.db";
 
+/// Threshold for the `nostr_query_slow_total` counter, applied
+/// uniformly across backends so the metric has the same meaning
+/// regardless of database engine.
+pub const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+
 /// Build repo
 /// # Panics
 ///
 /// Will panic if the pool could not be created.
 pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn NostrRepo> {
-    // The pool ceiling is static for the process lifetime, so set it
-    // once here rather than on every query. Plot
-    // `nostr_db_connections / nostr_db_pool_size` for saturation.
-    metrics
-        .db_pool_size
-        .set(i64::from(settings.database.max_conn));
+    // `db_pool_size` is set inside each backend's `build_*_pool`
+    // because the actual capacity depends on the pool layout
+    // (Postgres has up to two `max_conn` pools; SQLite has separate
+    // read/write/maintenance pools of different sizes).
     match settings.database.engine.as_str() {
         "sqlite" => Arc::new(build_sqlite_pool(settings, metrics).await),
         "postgres" => Arc::new(build_postgres_pool(settings, metrics).await),
@@ -58,6 +61,10 @@ pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn N
 
 async fn build_sqlite_pool(settings: &Settings, metrics: NostrMetrics) -> SqliteRepo {
     let repo = SqliteRepo::new(settings, metrics);
+    // `nostr_db_pool_size` is the sum of read + write + maintenance
+    // pool ceilings. SqliteRepo currently sizes write/maint at 2 each
+    // and the reader pool from `database.max_conn`.
+    repo.set_pool_size_metric();
     repo.start().await.ok();
     repo.migrate_up().await.ok();
     repo
@@ -92,6 +99,16 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
         }
         None => pool.clone(),
     };
+
+    // Total system capacity is the sum of both pool ceilings. When
+    // `connection_write` is unset the two `Arc<Pool>` references
+    // point at the same underlying pool, so summing in-use
+    // connections from both will report 2× the true count — but the
+    // ratio against this 2×-ceiling cancels out, so saturation math
+    // stays correct in both shared- and separate-pool deployments.
+    metrics
+        .db_pool_size
+        .set(i64::from(settings.database.max_conn).saturating_mul(2));
 
     let repo = PostgresRepo::new(pool, write_pool, metrics);
 
