@@ -103,13 +103,17 @@ impl SqliteRepo {
     }
 
     /// Set the static `nostr_db_pool_size` gauge to the sum of all
-    /// pool ceilings. Called once at startup. Matches the
-    /// "sum across pools" approach used by the Postgres backend so
-    /// dashboards interpret the gauge consistently across engines.
+    /// pool ceilings. Called once at startup. SQLite always has
+    /// three distinct pools (read, write, maintenance), so the
+    /// system capacity is the sum of all three.
+    /// `saturating_add` instead of `+` is defensive against
+    /// pathological misconfiguration overflowing `u32`.
     pub fn set_pool_size_metric(&self) {
-        let total: u32 = self.read_pool.max_size()
-            + self.write_pool.max_size()
-            + self.maint_pool.max_size();
+        let total: u32 = self
+            .read_pool
+            .max_size()
+            .saturating_add(self.write_pool.max_size())
+            .saturating_add(self.maint_pool.max_size());
         self.metrics.db_pool_size.set(i64::from(total));
     }
 

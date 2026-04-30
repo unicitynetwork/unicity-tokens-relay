@@ -29,37 +29,48 @@ pub struct PostgresRepo {
     conn: PostgresPool,
     conn_write: PostgresPool,
     metrics: NostrMetrics,
+    /// `true` when `database.connection_write` is configured and the
+    /// repo holds two distinct pools. When `false`, `conn` and
+    /// `conn_write` are clones pointing at the same underlying pool
+    /// — pool metrics must read from one of them only, otherwise the
+    /// in-use count would double-count the shared pool.
+    separate_write_pool: bool,
 }
 
 impl PostgresRepo {
-    pub fn new(c: PostgresPool, cw: PostgresPool, m: NostrMetrics) -> PostgresRepo {
+    pub fn new(
+        c: PostgresPool,
+        cw: PostgresPool,
+        m: NostrMetrics,
+        separate_write_pool: bool,
+    ) -> PostgresRepo {
         PostgresRepo {
             conn: c,
             conn_write: cw,
             metrics: m,
+            separate_write_pool,
         }
+    }
+
+    /// Refresh `nostr_db_connections` from the sqlx pool(s).
+    ///
+    /// In separate-pool mode (`database.connection_write` set), sums
+    /// in-use across the read and write pools so the gauge reflects
+    /// total system load — without this it would flap between pools
+    /// depending on which call path most recently fired.
+    /// In shared-pool mode, reads from the single pool only.
+    fn update_pool_gauge(&self) {
+        let in_use = if self.separate_write_pool {
+            pool_in_use(&self.conn).saturating_add(pool_in_use(&self.conn_write))
+        } else {
+            pool_in_use(&self.conn)
+        };
+        self.metrics.db_connections.set(i64::from(in_use));
     }
 }
 
 fn pool_in_use(pool: &PostgresPool) -> u32 {
     pool.size().saturating_sub(pool.num_idle() as u32)
-}
-
-/// Refresh `nostr_db_connections` from the sqlx pools. Until this
-/// was added the gauge was wired only on the SQLite path, so the
-/// dashboard panel sat at 0 in production (Postgres) deployments
-/// even when RDS DatabaseConnections was pegged at max_conn.
-///
-/// PostgresRepo can have separate read and write pools, so the
-/// gauge sums in-use across both — otherwise it would flap between
-/// pools depending on which call path most recently fired. When
-/// `connection_write` is unset both Arcs point at the same pool, so
-/// summing reports 2× the true count; this is intentional and
-/// consistent with the 2× value `db_pool_size` is set to, so
-/// saturation math (`db_connections / db_pool_size`) stays correct.
-fn update_pool_gauge(read_pool: &PostgresPool, write_pool: &PostgresPool, metrics: &NostrMetrics) {
-    let in_use = pool_in_use(read_pool).saturating_add(pool_in_use(write_pool));
-    metrics.db_connections.set(i64::from(in_use));
 }
 
 /// Cleanup expired events on a regular basis
@@ -116,7 +127,7 @@ impl NostrRepo for PostgresRepo {
         // connection — observing it earlier would miss the slot we
         // are about to occupy and undercount in-use connections by 1.
         let mut tx = self.conn_write.begin().await?;
-        update_pool_gauge(&self.conn, &self.conn_write, &self.metrics);
+        self.update_pool_gauge();
         let start = Instant::now();
 
         // get relevant fields from event and convert to blobs.
@@ -352,7 +363,7 @@ ON CONFLICT (id) DO NOTHING"#,
             // Refresh the pool gauge per filter — sqlx acquires from
             // the pool on each `.fetch(...)` so a single update before
             // the loop would miss most of the burst.
-            update_pool_gauge(&self.conn, &self.conn_write, metrics);
+            self.update_pool_gauge();
             let filter_start = Instant::now();
             // generate SQL query
             let q_filter = query_from_filter(filter);

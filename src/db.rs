@@ -100,17 +100,19 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
         None => pool.clone(),
     };
 
-    // Total system capacity is the sum of both pool ceilings. When
-    // `connection_write` is unset the two `Arc<Pool>` references
-    // point at the same underlying pool, so summing in-use
-    // connections from both will report 2× the true count — but the
-    // ratio against this 2×-ceiling cancels out, so saturation math
-    // stays correct in both shared- and separate-pool deployments.
-    metrics
-        .db_pool_size
-        .set(i64::from(settings.database.max_conn).saturating_mul(2));
+    // Report the actual configured ceiling. With
+    // `connection_write` unset, `write_pool` is just a clone of
+    // `pool`, so there's only one underlying pool with `max_conn`
+    // slots. With it configured, both pools have `max_conn` each.
+    let separate_write_pool = settings.database.connection_write.is_some();
+    let db_pool_size = if separate_write_pool {
+        i64::from(settings.database.max_conn).saturating_mul(2)
+    } else {
+        i64::from(settings.database.max_conn)
+    };
+    metrics.db_pool_size.set(db_pool_size);
 
-    let repo = PostgresRepo::new(pool, write_pool, metrics);
+    let repo = PostgresRepo::new(pool, write_pool, metrics, separate_write_pool);
 
     // Panic on migration failure
     let version = repo.migrate_up().await.unwrap();
