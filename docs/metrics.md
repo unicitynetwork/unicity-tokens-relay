@@ -43,6 +43,7 @@ Counters for raw command frames received from clients.
 | `nostr_events_ephemeral_broadcast_by_kind_total` | counter | `kind` | Ephemeral events broadcast to subscribers without being persisted, by kind. |
 | `nostr_events_rejected_total` | counter | `reason` | Events rejected before persistence. Reasons: `expired`, `future_dated`, `kind_blacklist`, `kind_allowlist`, `pubkey_not_whitelisted`, `not_admitted`, `insufficient_balance`, `pubkey_not_registered`, `admission_check_error`, `nip05_invalid`, `nip05_missing`, `nip05_error`, `grpc_denied`, `duplicate`, `write_error` |
 | `nostr_events_sent_total` | counter | `source` | Events sent to subscribers. `source` = `db` (historical query result) or `realtime` (broadcast match) |
+| `nostr_broadcast_lagged_total` | counter | — | Broadcast events dropped because a per-connection receiver fell behind (the receiver's slot in the broadcast channel overflowed `broadcast_buffer`). Spikes here indicate slow consumers — usually backpressure from a stuck `ws_stream.send`. |
 
 ### Latency histograms
 

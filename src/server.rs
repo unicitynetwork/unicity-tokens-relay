@@ -729,6 +729,11 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     .unwrap();
     let connections =
         IntCounter::with_opts(Opts::new("nostr_connections_total", "New connections")).unwrap();
+    let broadcast_lagged = IntCounter::with_opts(Opts::new(
+        "nostr_broadcast_lagged_total",
+        "Broadcast events dropped because a per-connection receiver fell behind",
+    ))
+    .unwrap();
     let db_connections = IntGauge::with_opts(Opts::new(
         "nostr_db_connections",
         "Active database connections",
@@ -821,6 +826,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(write_events.clone())).unwrap();
     registry.register(Box::new(sent_events.clone())).unwrap();
     registry.register(Box::new(connections.clone())).unwrap();
+    registry.register(Box::new(broadcast_lagged.clone())).unwrap();
     registry.register(Box::new(db_connections.clone())).unwrap();
     registry.register(Box::new(query_aborts.clone())).unwrap();
     registry.register(Box::new(cmd_req.clone())).unwrap();
@@ -844,6 +850,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         write_events,
         sent_events,
         connections,
+        broadcast_lagged,
         db_connections,
         disconnects,
         query_aborts,
@@ -1409,8 +1416,24 @@ async fn nostr_server(
                     }
                 }
             },
-            // TODO: consider logging the LaggedRecv error
-            Ok(global_event) = bcast_rx.recv() => {
+            bcast_result = bcast_rx.recv() => {
+                let global_event = match bcast_result {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer: broadcast channel dropped n events for
+                        // this receiver. Surface it as a counter so we can spot
+                        // chronic lag in production instead of losing events
+                        // silently.
+                        metrics.broadcast_lagged.inc_by(n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Broadcast sender is gone (relay shutdown / db_writer
+                        // exit). No more events will arrive on this channel,
+                        // so close the connection rather than spinning forever.
+                        break;
+                    }
+                };
                 let mut should_disconnect = false;
                 // an event has been broadcast to all clients
                 // first check if there is a subscription for this event.
@@ -1782,6 +1805,7 @@ pub struct NostrMetrics {
     pub write_events: Histogram,     // response time of event writes
     pub sent_events: IntCounterVec,  // count of events sent to clients
     pub connections: IntCounter,     // count of websocket connections
+    pub broadcast_lagged: IntCounter, // broadcast events dropped because a receiver fell behind
     pub disconnects: IntCounterVec,  // client disconnects
     pub query_aborts: IntCounterVec, // count of queries aborted by server
     pub cmd_req: IntCounter,         // count of REQ commands received
