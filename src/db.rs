@@ -545,9 +545,18 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
                     // Yield instead of blocking the worker thread — db_writer is
                     // an async task on the tokio runtime, so std::thread::sleep
                     // would pin the whole worker (including any other tasks
-                    // sharing it) for the rate-limit window.
-                    tokio::time::sleep(wait_for).await;
-                    continue;
+                    // sharing it) for the rate-limit window. The select on
+                    // shutdown.recv() also bails out promptly if the relay is
+                    // shutting down mid-sleep, instead of waiting up to
+                    // `wait_for` seconds for the next try_recv at the top of
+                    // the loop.
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait_for) => {}
+                        _ = shutdown.recv() => {
+                            info!("shutting down database writer");
+                            break;
+                        }
+                    }
                 }
             }
         }
