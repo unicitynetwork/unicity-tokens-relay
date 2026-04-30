@@ -42,12 +42,10 @@ pub struct Network {
     pub port: u16,
     pub address: String,
     pub remote_ip_header: Option<String>, // retrieve client IP from this HTTP header if present
-    // The previous example config showed `ping_interval` (no `_seconds` suffix),
-    // which was always silently ignored. The canonical key is this one. We
-    // can't add a serde alias to recover the legacy name: the defaults loaded
-    // by `Config::try_from(default)` already populate `ping_interval_seconds`,
-    // so a user override of `ping_interval` ends up in the same merged map
-    // alongside it, and serde fails the deserialize with `duplicate field`.
+    // Don't add `#[serde(alias = "...")]` here. Defaults loaded via
+    // `Config::try_from(default)` always populate this canonical key in the
+    // merged map, so a user override under any alias collides with it and
+    // serde rejects the deserialize with `duplicate field`.
     pub ping_interval_seconds: u32,
 }
 
@@ -250,8 +248,8 @@ impl Settings {
             settings.verified_users.is_valid(),
             "VerifiedUsers time settings could not be parsed"
         );
-        // tokio::time::interval_at panics on zero duration; surface this as a
-        // ConfigError so the caller in `Settings::new` can format it cleanly.
+        // tokio::time::interval_at panics on zero duration; reject at config
+        // load time with a propagated ConfigError instead of crashing later.
         if settings.network.ping_interval_seconds == 0 {
             return Err(ConfigError::Message(
                 "network.ping_interval_seconds must be > 0".into(),
@@ -320,8 +318,7 @@ impl Default for Settings {
                 // 45s sits below typical client-side middlebox idle timeouts
                 // (corporate proxies, mobile carrier NATs, residential CGNATs)
                 // which often reap quiet upgraded WebSocket connections in the
-                // 60–300s range. Server-side reverse proxies are unaffected at
-                // this value too.
+                // 60–300s range.
                 ping_interval_seconds: 45,
                 address: "0.0.0.0".to_owned(),
                 remote_ip_header: None,
@@ -382,5 +379,82 @@ impl Default for Settings {
                 file_prefix: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_config(body: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nostr-relay-config-{}-{}.toml",
+            std::process::id(),
+            stamp
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn rejects_zero_ping_interval() {
+        let path = write_temp_config(
+            r#"
+[network]
+ping_interval_seconds = 0
+"#,
+        );
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        match result {
+            Err(ConfigError::Message(msg)) => {
+                assert!(
+                    msg.contains("ping_interval_seconds"),
+                    "error message should mention the offending key, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Message for zero ping interval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_ping_interval_is_silently_ignored() {
+        // This pins the rationale in `Network::ping_interval_seconds`: we don't
+        // (and can't) accept the legacy `ping_interval` key. Any user override
+        // under that name is ignored, the default fills the canonical key, and
+        // load succeeds.
+        let path = write_temp_config(
+            r#"
+[network]
+ping_interval = 30
+"#,
+        );
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        let settings = result.expect("legacy key should be ignored, not break loading");
+        assert_eq!(
+            settings.network.ping_interval_seconds, 45,
+            "legacy `ping_interval` must not bleed into the canonical field"
+        );
+    }
+
+    #[test]
+    fn accepts_canonical_ping_interval_seconds() {
+        let path = write_temp_config(
+            r#"
+[network]
+ping_interval_seconds = 30
+"#,
+        );
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        let settings = result.expect("valid override should load");
+        assert_eq!(settings.network.ping_interval_seconds, 30);
     }
 }
