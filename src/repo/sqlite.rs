@@ -35,6 +35,11 @@ pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 pub type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 pub const DB_FILE: &str = "nostr.db";
 
+/// Threshold for the `nostr_query_slow_total` counter. Mirrors the
+/// constant in the Postgres backend so the dashboard interprets the
+/// counter consistently across engines.
+const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub struct SqliteRepo {
     /// Metrics
@@ -308,9 +313,14 @@ impl NostrRepo for SqliteRepo {
             }
         })
         .await?;
-        self.metrics
-            .write_events
-            .observe(start.elapsed().as_secs_f64());
+        let elapsed = start.elapsed();
+        self.metrics.write_events.observe(elapsed.as_secs_f64());
+        if elapsed >= SLOW_THRESHOLD {
+            self.metrics
+                .query_slow_total
+                .with_label_values(&["write"])
+                .inc();
+        }
         event_count
     }
 
@@ -502,11 +512,16 @@ impl NostrRepo for SqliteRepo {
                             .ok();
                         last_successful_send = Instant::now();
                     }
-                    metrics
-                        .query_db
-                        .observe(filter_start.elapsed().as_secs_f64());
+                    let filter_elapsed = filter_start.elapsed();
+                    metrics.query_db.observe(filter_elapsed.as_secs_f64());
+                    if filter_elapsed >= SLOW_THRESHOLD {
+                        metrics
+                            .query_slow_total
+                            .with_label_values(&["filter"])
+                            .inc();
+                    }
                     // if the filter took too much db_time, print out the JSON.
-                    if filter_start.elapsed() > slow_cutoff && client_id.starts_with('0') {
+                    if filter_elapsed > slow_cutoff && client_id.starts_with('0') {
                         debug!(
                             "query filter req (slow): {} (cid: {}, sub: {:?}, filter: {})",
                             serde_json::to_string(&filter)?,
@@ -534,9 +549,14 @@ impl NostrRepo for SqliteRepo {
                     event: "EOSE".to_string(),
                 })
                 .ok();
-            metrics
-                .query_sub
-                .observe(pre_spawn_start.elapsed().as_secs_f64());
+            let sub_elapsed = pre_spawn_start.elapsed();
+            metrics.query_sub.observe(sub_elapsed.as_secs_f64());
+            if sub_elapsed >= SLOW_THRESHOLD {
+                metrics
+                    .query_slow_total
+                    .with_label_values(&["subscription"])
+                    .inc();
+            }
             let ok: Result<()> = Ok(());
             ok
         });

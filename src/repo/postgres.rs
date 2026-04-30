@@ -41,6 +41,20 @@ impl PostgresRepo {
     }
 }
 
+/// Threshold for the `nostr_query_slow_total` counter. 1s matches
+/// the value in the issue example and is well above normal
+/// per-filter latency.
+const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// Refresh `nostr_db_connections` from the sqlx pool. Until this was
+/// added the gauge was wired only on the SQLite path, so the
+/// dashboard panel sat at 0 in production (Postgres) deployments
+/// even when RDS DatabaseConnections was pegged at max_conn.
+fn update_pool_gauge(pool: &PostgresPool, metrics: &NostrMetrics) {
+    let in_use = pool.size().saturating_sub(pool.num_idle() as u32);
+    metrics.db_connections.set(i64::from(in_use));
+}
+
 /// Cleanup expired events on a regular basis
 async fn cleanup_expired(conn: PostgresPool, frequency: Duration) -> Result<()> {
     tokio::task::spawn(async move {
@@ -92,6 +106,7 @@ impl NostrRepo for PostgresRepo {
 
     async fn write_event(&self, e: &Event) -> Result<u64> {
         // start transaction
+        update_pool_gauge(&self.conn_write, &self.metrics);
         let mut tx = self.conn_write.begin().await?;
         let start = Instant::now();
 
@@ -302,9 +317,14 @@ ON CONFLICT (id) DO NOTHING"#,
             }
         }
         tx.commit().await?;
-        self.metrics
-            .write_events
-            .observe(start.elapsed().as_secs_f64());
+        let elapsed = start.elapsed();
+        self.metrics.write_events.observe(elapsed.as_secs_f64());
+        if elapsed >= SLOW_THRESHOLD {
+            self.metrics
+                .query_slow_total
+                .with_label_values(&["write"])
+                .inc();
+        }
         Ok(ins_count)
     }
 
@@ -315,12 +335,13 @@ ON CONFLICT (id) DO NOTHING"#,
         query_tx: Sender<QueryResult>,
         mut abandon_query_rx: Receiver<()>,
     ) -> Result<()> {
+        update_pool_gauge(&self.conn, &self.metrics);
         let start = Instant::now();
         let mut row_count: usize = 0;
         let metrics = &self.metrics;
 
         for filter in sub.filters.iter() {
-            let start = Instant::now();
+            let filter_start = Instant::now();
             // generate SQL query
             let q_filter = query_from_filter(filter);
             if q_filter.is_none() {
@@ -328,7 +349,7 @@ ON CONFLICT (id) DO NOTHING"#,
                 continue;
             }
 
-            debug!("SQL generated in {:?}", start.elapsed());
+            debug!("SQL generated in {:?}", filter_start.elapsed());
 
             // cutoff for displaying slow queries
             let slow_cutoff = Duration::from_millis(2000);
@@ -337,7 +358,7 @@ ON CONFLICT (id) DO NOTHING"#,
             // seconds gets dropped.
             let abort_cutoff = Duration::from_secs(5);
 
-            let start = Instant::now();
+            let filter_query_start = Instant::now();
             let mut slow_first_event;
             let mut last_successful_send = Instant::now();
 
@@ -353,7 +374,7 @@ ON CONFLICT (id) DO NOTHING"#,
                     error!("Query failed: {} {} {:?}", e, sql, filter);
                     break;
                 }
-                let first_event_elapsed = start.elapsed();
+                let first_event_elapsed = filter_query_start.elapsed();
                 slow_first_event = first_event_elapsed >= slow_cutoff;
                 if first_result {
                     debug!(
@@ -423,6 +444,18 @@ ON CONFLICT (id) DO NOTHING"#,
                     .ok();
                 last_successful_send = Instant::now();
             }
+            // Per-filter latency: previously only sqlite observed
+            // this, so on Postgres the `nostr_filter_seconds` panel
+            // was empty even though it was the dominant signal in
+            // the Apr 30 incident.
+            let filter_elapsed = filter_query_start.elapsed();
+            metrics.query_db.observe(filter_elapsed.as_secs_f64());
+            if filter_elapsed >= SLOW_THRESHOLD {
+                metrics
+                    .query_slow_total
+                    .with_label_values(&["filter"])
+                    .inc();
+            }
         }
         query_tx
             .send(QueryResult {
@@ -431,16 +464,17 @@ ON CONFLICT (id) DO NOTHING"#,
             })
             .await
             .ok();
-        self.metrics
-            .query_sub
-            .observe(start.elapsed().as_secs_f64());
+        let sub_elapsed = start.elapsed();
+        self.metrics.query_sub.observe(sub_elapsed.as_secs_f64());
+        if sub_elapsed >= SLOW_THRESHOLD {
+            self.metrics
+                .query_slow_total
+                .with_label_values(&["subscription"])
+                .inc();
+        }
         debug!(
-            "query completed in {:?} (cid: {}, sub: {:?}, db_time: {:?}, rows: {})",
-            start.elapsed(),
-            client_id,
-            sub.id,
-            start.elapsed(),
-            row_count
+            "query completed in {:?} (cid: {}, sub: {:?}, rows: {})",
+            sub_elapsed, client_id, sub.id, row_count
         );
         Ok(())
     }

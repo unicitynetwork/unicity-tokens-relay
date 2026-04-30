@@ -43,6 +43,12 @@ pub const DB_FILE: &str = "nostr.db";
 ///
 /// Will panic if the pool could not be created.
 pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn NostrRepo> {
+    // The pool ceiling is static for the process lifetime, so set it
+    // once here rather than on every query. Plot
+    // `nostr_db_connections / nostr_db_pool_size` for saturation.
+    metrics
+        .db_pool_size
+        .set(i64::from(settings.database.max_conn));
     match settings.database.engine.as_str() {
         "sqlite" => Arc::new(build_sqlite_pool(settings, metrics).await),
         "postgres" => Arc::new(build_postgres_pool(settings, metrics).await),

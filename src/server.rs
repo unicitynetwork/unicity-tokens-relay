@@ -707,20 +707,28 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         ))
         .unwrap();
 
-    let query_sub = Histogram::with_opts(HistogramOpts::new(
-        "nostr_query_seconds",
-        "Subscription response times",
-    ))
+    // Explicit buckets reaching to 300s. Prometheus' default top
+    // bucket is 10s, which silently caps p99 at ~10s and hid the
+    // 60-150s `sqlx` query latencies during the Apr 30 buffer-pool
+    // incident — long-tail latency was visible only in CloudWatch
+    // Logs as `WARN sqlx::query: ... elapsed: Xs`.
+    let latency_buckets = vec![
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    ];
+    let query_sub = Histogram::with_opts(
+        HistogramOpts::new("nostr_query_seconds", "Subscription response times")
+            .buckets(latency_buckets.clone()),
+    )
     .unwrap();
-    let query_db = Histogram::with_opts(HistogramOpts::new(
-        "nostr_filter_seconds",
-        "Filter SQL query times",
-    ))
+    let query_db = Histogram::with_opts(
+        HistogramOpts::new("nostr_filter_seconds", "Filter SQL query times")
+            .buckets(latency_buckets.clone()),
+    )
     .unwrap();
-    let write_events = Histogram::with_opts(HistogramOpts::new(
-        "nostr_events_write_seconds",
-        "Event writing response times",
-    ))
+    let write_events = Histogram::with_opts(
+        HistogramOpts::new("nostr_events_write_seconds", "Event writing response times")
+            .buckets(latency_buckets),
+    )
     .unwrap();
     let sent_events = IntCounterVec::new(
         Opts::new("nostr_events_sent_total", "Events sent to clients"),
@@ -738,6 +746,27 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         "nostr_db_connections",
         "Active database connections",
     ))
+    .unwrap();
+    // Total slot ceiling, configured via `database.max_conn`. Plot
+    // alongside `nostr_db_connections` as a saturation gauge
+    // (`nostr_db_connections / nostr_db_pool_size`); without it a
+    // raw connection count has no scale to alert against.
+    let db_pool_size = IntGauge::with_opts(Opts::new(
+        "nostr_db_pool_size",
+        "Configured maximum database pool size",
+    ))
+    .unwrap();
+    // Counter incremented when an instrumented query exceeds 1s.
+    // Pairs with the histogram for alerting: a histogram quantile
+    // shows the distribution, this counter gives a clean
+    // `rate(...[5m]) > 0` signal the moment slow queries appear.
+    let query_slow_total = IntCounterVec::new(
+        Opts::new(
+            "nostr_query_slow_total",
+            "Database operations that exceeded the slow-query threshold (1s), by source",
+        ),
+        vec!["source"].as_slice(),
+    )
     .unwrap();
     let query_aborts = IntCounterVec::new(
         Opts::new("nostr_query_abort_total", "Aborted queries"),
@@ -828,6 +857,8 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(connections.clone())).unwrap();
     registry.register(Box::new(broadcast_lagged.clone())).unwrap();
     registry.register(Box::new(db_connections.clone())).unwrap();
+    registry.register(Box::new(db_pool_size.clone())).unwrap();
+    registry.register(Box::new(query_slow_total.clone())).unwrap();
     registry.register(Box::new(query_aborts.clone())).unwrap();
     registry.register(Box::new(cmd_req.clone())).unwrap();
     registry.register(Box::new(cmd_event.clone())).unwrap();
@@ -852,6 +883,8 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         connections,
         broadcast_lagged,
         db_connections,
+        db_pool_size,
+        query_slow_total,
         disconnects,
         query_aborts,
         cmd_req,
@@ -1846,6 +1879,8 @@ pub struct NostrMetrics {
     pub query_sub: Histogram,        // response time of successful subscriptions
     pub query_db: Histogram,         // individual database query execution time
     pub db_connections: IntGauge,    // database connections in use
+    pub db_pool_size: IntGauge,      // configured pool ceiling (database.max_conn)
+    pub query_slow_total: IntCounterVec, // operations exceeding 1s, by source
     pub write_events: Histogram,     // response time of event writes
     pub sent_events: IntCounterVec,  // count of events sent to clients
     pub connections: IntCounter,     // count of websocket connections
