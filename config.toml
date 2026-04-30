@@ -95,8 +95,11 @@ port = 8080
 #remote_ip_header = "x-forwarded-for"
 #remote_ip_header = "cf-connecting-ip"
 
-# Websocket ping interval in seconds, defaults to 5 minutes
-#ping_interval = 300
+# WebSocket keep-alive ping interval, in seconds. Default is 45.
+# Set this below the idle timeout of any reverse proxy or middlebox between
+# the client and the relay. Common values: AWS ALB default 60s, Cloudflare
+# ~100s, mobile/CGNAT idle timeouts often 60–300s.
+#ping_interval_seconds = 45
 
 [options]
 # Reject events that have timestamps greater than this many seconds in

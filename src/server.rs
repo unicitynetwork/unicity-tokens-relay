@@ -1312,11 +1312,13 @@ async fn nostr_server(
     // last time this client sent data (message, ping, etc.)
     let mut last_message_time = Instant::now();
 
-    // ping interval (every 5 minutes)
+    // ping interval — defaults to 45s, see config.rs for rationale.
     let default_ping_dur = Duration::from_secs(settings.network.ping_interval_seconds.into());
 
-    // disconnect after 20 minutes without a ping response or event.
-    let max_quiet_time = Duration::from_secs(60 * 20);
+    // Disconnect a client that hasn't said anything for ~4 ping intervals.
+    // Floor at 5 minutes so very short ping intervals don't reap clients that
+    // briefly stop responding (e.g. mobile suspending the tab).
+    let max_quiet_time = std::cmp::max(Duration::from_secs(300), default_ping_dur * 4);
 
     let start = tokio::time::Instant::now() + default_ping_dur;
     let mut ping_interval = tokio::time::interval_at(start, default_ping_dur);
