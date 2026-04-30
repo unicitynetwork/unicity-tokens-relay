@@ -247,6 +247,12 @@ impl Settings {
             settings.verified_users.is_valid(),
             "VerifiedUsers time settings could not be parsed"
         );
+        // tokio::time::interval_at panics on zero duration; reject early with a
+        // clear message instead of crashing the server after deploy.
+        assert!(
+            settings.network.ping_interval_seconds > 0,
+            "network.ping_interval_seconds must be > 0"
+        );
         // initialize durations for verified users
         settings.verified_users.init();
 
