@@ -439,7 +439,8 @@ ping_interval = 30
         std::fs::remove_file(&path).ok();
         let settings = result.expect("legacy key should be ignored, not break loading");
         assert_eq!(
-            settings.network.ping_interval_seconds, 45,
+            settings.network.ping_interval_seconds,
+            Settings::default().network.ping_interval_seconds,
             "legacy `ping_interval` must not bleed into the canonical field"
         );
     }
