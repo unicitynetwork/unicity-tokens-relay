@@ -42,6 +42,9 @@ pub struct Network {
     pub port: u16,
     pub address: String,
     pub remote_ip_header: Option<String>, // retrieve client IP from this HTTP header if present
+    // Older configs used `ping_interval`; accept that name too so previously-broken
+    // configs (silently ignored due to the field-name mismatch) start taking effect.
+    #[serde(alias = "ping_interval")]
     pub ping_interval_seconds: u32,
 }
 
@@ -304,7 +307,12 @@ impl Default for Settings {
             },
             network: Network {
                 port: 8080,
-                ping_interval_seconds: 300,
+                // 45s sits below typical client-side middlebox idle timeouts
+                // (corporate proxies, mobile carrier NATs, residential CGNATs)
+                // which often reap quiet upgraded WebSocket connections in the
+                // 60–300s range. Server-side reverse proxies are unaffected at
+                // this value too.
+                ping_interval_seconds: 45,
                 address: "0.0.0.0".to_owned(),
                 remote_ip_header: None,
             },
