@@ -1419,7 +1419,7 @@ async fn nostr_server(
             bcast_result = bcast_rx.recv() => {
                 let global_event = match bcast_result {
                     Ok(ev) => ev,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Slow consumer: broadcast channel dropped n events for
                         // this receiver. Surface it as a counter so we can spot
                         // chronic lag in production instead of losing events
@@ -1427,10 +1427,13 @@ async fn nostr_server(
                         metrics.broadcast_lagged.inc_by(n);
                         continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(broadcast::error::RecvError::Closed) => {
                         // Broadcast sender is gone (relay shutdown / db_writer
                         // exit). No more events will arrive on this channel,
                         // so close the connection rather than spinning forever.
+                        // Tag the disconnect so this case is visible in
+                        // dashboards alongside other fatal exits.
+                        metrics.disconnects.with_label_values(&["broadcast_closed"]).inc();
                         break;
                     }
                 };
