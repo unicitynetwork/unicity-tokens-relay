@@ -1,4 +1,4 @@
-use crate::db::QueryResult;
+use crate::db::{QueryResult, SLOW_THRESHOLD};
 use crate::error;
 use crate::error::Result;
 use crate::event::{single_char_tagname, Event};
@@ -41,17 +41,24 @@ impl PostgresRepo {
     }
 }
 
-/// Threshold for the `nostr_query_slow_total` counter. 1s matches
-/// the value in the issue example and is well above normal
-/// per-filter latency.
-const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+fn pool_in_use(pool: &PostgresPool) -> u32 {
+    pool.size().saturating_sub(pool.num_idle() as u32)
+}
 
-/// Refresh `nostr_db_connections` from the sqlx pool. Until this was
-/// added the gauge was wired only on the SQLite path, so the
+/// Refresh `nostr_db_connections` from the sqlx pools. Until this
+/// was added the gauge was wired only on the SQLite path, so the
 /// dashboard panel sat at 0 in production (Postgres) deployments
 /// even when RDS DatabaseConnections was pegged at max_conn.
-fn update_pool_gauge(pool: &PostgresPool, metrics: &NostrMetrics) {
-    let in_use = pool.size().saturating_sub(pool.num_idle() as u32);
+///
+/// PostgresRepo can have separate read and write pools, so the
+/// gauge sums in-use across both — otherwise it would flap between
+/// pools depending on which call path most recently fired. When
+/// `connection_write` is unset both Arcs point at the same pool, so
+/// summing reports 2× the true count; this is intentional and
+/// consistent with the 2× value `db_pool_size` is set to, so
+/// saturation math (`db_connections / db_pool_size`) stays correct.
+fn update_pool_gauge(read_pool: &PostgresPool, write_pool: &PostgresPool, metrics: &NostrMetrics) {
+    let in_use = pool_in_use(read_pool).saturating_add(pool_in_use(write_pool));
     metrics.db_connections.set(i64::from(in_use));
 }
 
@@ -105,9 +112,11 @@ impl NostrRepo for PostgresRepo {
     }
 
     async fn write_event(&self, e: &Event) -> Result<u64> {
-        // start transaction
-        update_pool_gauge(&self.conn_write, &self.metrics);
+        // Refresh the gauge after `begin()` actually checks out a
+        // connection — observing it earlier would miss the slot we
+        // are about to occupy and undercount in-use connections by 1.
         let mut tx = self.conn_write.begin().await?;
+        update_pool_gauge(&self.conn, &self.conn_write, &self.metrics);
         let start = Instant::now();
 
         // get relevant fields from event and convert to blobs.
@@ -335,12 +344,15 @@ ON CONFLICT (id) DO NOTHING"#,
         query_tx: Sender<QueryResult>,
         mut abandon_query_rx: Receiver<()>,
     ) -> Result<()> {
-        update_pool_gauge(&self.conn, &self.metrics);
         let start = Instant::now();
         let mut row_count: usize = 0;
         let metrics = &self.metrics;
 
         for filter in sub.filters.iter() {
+            // Refresh the pool gauge per filter — sqlx acquires from
+            // the pool on each `.fetch(...)` so a single update before
+            // the loop would miss most of the burst.
+            update_pool_gauge(&self.conn, &self.conn_write, metrics);
             let filter_start = Instant::now();
             // generate SQL query
             let q_filter = query_from_filter(filter);
