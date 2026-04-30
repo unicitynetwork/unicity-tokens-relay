@@ -1315,9 +1315,10 @@ async fn nostr_server(
     // ping interval — defaults to 45s, see config.rs for rationale.
     let default_ping_dur = Duration::from_secs(settings.network.ping_interval_seconds.into());
 
-    // Disconnect a client that hasn't said anything for ~4 ping intervals.
-    // Floor at 5 minutes so very short ping intervals don't reap clients that
-    // briefly stop responding (e.g. mobile suspending the tab).
+    // Disconnect a client that hasn't said anything for a while. Target is
+    // ~4 ping intervals, but floored at 5 minutes so brief pauses (e.g. mobile
+    // suspending the tab) don't trigger reaps at short ping intervals. With
+    // the 45s default the floor wins, giving ~6.7 ping intervals before reap.
     let max_quiet_time = std::cmp::max(Duration::from_secs(300), default_ping_dur * 4);
 
     let start = tokio::time::Instant::now() + default_ping_dur;
