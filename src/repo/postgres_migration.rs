@@ -477,11 +477,15 @@ mod m006 {
 ///
 /// Creating the statistics is cheap; the `ANALYZE` afterwards is what
 /// actually populates them. ANALYZE is non-blocking for reads and
-/// writes but samples the table and can take ~30 s on a multi-million
-/// row event table. The TCP listener doesn't bind until
-/// `run_migrations` returns, so a fresh container is unreachable
-/// during ANALYZE — same situation as m006's CONCURRENTLY index
-/// builds, typically absorbed by the ECS health-check grace period.
+/// writes but samples the table; the call below is column-scoped to
+/// `(kind, pub_key, delegated_by)` so only those columns and any
+/// extended-stats objects that cover only those columns get
+/// recomputed — both new objects qualify, and a wide table avoids
+/// re-sampling per-column stats it doesn't need. The TCP listener
+/// doesn't bind until `run_migrations` returns, so a fresh container
+/// is unreachable during ANALYZE — same situation as m006's
+/// CONCURRENTLY index builds, typically absorbed by the ECS
+/// health-check grace period.
 ///
 /// Re-uses the m006 pattern: single connection, session-level
 /// `pg_advisory_lock` to serialize concurrent startups, re-check
@@ -533,22 +537,37 @@ mod m007 {
             return Ok(());
         }
 
+        // Schema-qualify the stats object names. CREATE STATISTICS
+        // honors search_path for the new object's schema even when
+        // the source table is schema-qualified, so an unqualified
+        // name could land the stats in whatever schema is first in
+        // the connection's search_path — silently invisible to the
+        // planner against public."event". Same defensive convention
+        // as elsewhere in this crate (see m006).
         info!("m007: creating extended statistics on (kind, pub_key) and (kind, delegated_by)");
         (&mut *conn)
             .execute(
-                r#"CREATE STATISTICS IF NOT EXISTS event_kind_pub_key_stats
+                r#"CREATE STATISTICS IF NOT EXISTS public.event_kind_pub_key_stats
    (ndistinct, dependencies, mcv) ON kind, pub_key FROM public."event""#,
             )
             .await?;
         (&mut *conn)
             .execute(
-                r#"CREATE STATISTICS IF NOT EXISTS event_kind_delegated_by_stats
+                r#"CREATE STATISTICS IF NOT EXISTS public.event_kind_delegated_by_stats
    (ndistinct, dependencies, mcv) ON kind, delegated_by FROM public."event""#,
             )
             .await?;
 
-        info!("m007: running ANALYZE on event to populate the new statistics (may take ~30s on large tables)");
-        (&mut *conn).execute(r#"ANALYZE public."event""#).await?;
+        // Column-scoped ANALYZE: only the listed columns get
+        // re-sampled, and any extended statistics whose columns are
+        // all in the list are re-populated. Both new stats objects
+        // qualify, so they end up populated, but we skip work for
+        // every other column on a wide table — meaningfully shorter
+        // wall-clock than a bare `ANALYZE event` on a 10M-row table.
+        info!("m007: running ANALYZE on event(kind, pub_key, delegated_by) to populate the new statistics");
+        (&mut *conn)
+            .execute(r#"ANALYZE public."event" (kind, pub_key, delegated_by)"#)
+            .await?;
 
         sqlx::query("INSERT INTO migrations VALUES ($1)")
             .bind(VERSION)
