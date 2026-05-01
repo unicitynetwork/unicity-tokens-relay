@@ -38,6 +38,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     run_migration(m004::migration(), db).await;
     run_migration(m005::migration(), db).await;
     m006::run(db).await?;
+    m007::run(db).await?;
     Ok(current_version(db).await as usize)
 }
 
@@ -456,6 +457,102 @@ mod m006 {
             .execute(&mut *conn)
             .await?;
 
+        Ok(())
+    }
+}
+
+/// Add multivariate extended statistics on `(kind, pub_key)` and
+/// `(kind, delegated_by)`.
+///
+/// Without these, the planner has no idea that for a specific
+/// `pub_key` the `(kind, pub_key)` combination is highly selective —
+/// it estimates the conjunction by multiplying single-column
+/// selectivities and concludes the cheapest plan is to walk the
+/// `(created_at, kind)` index backward and filter. In production this
+/// turned a `WHERE (pub_key=X OR delegated_by=X) AND kind=K ORDER BY
+/// created_at DESC LIMIT 5` query into a 12 s scan of ~40 k random
+/// heap pages and re-saturated the connection pool that m006's
+/// composite indexes were supposed to relieve. The composite indexes
+/// existed and were valid; the planner just wasn't choosing them.
+///
+/// Creating the statistics is cheap; the `ANALYZE` afterwards is what
+/// actually populates them. ANALYZE is non-blocking for reads and
+/// writes but samples the table and can take ~30 s on a multi-million
+/// row event table — startup is delayed by that long the first time.
+///
+/// Re-uses the m006 pattern: single connection, session-level
+/// `pg_advisory_lock` to serialize concurrent startups, re-check
+/// inside the lock, idempotent SQL (`IF NOT EXISTS`) so it's a no-op
+/// on databases where an operator already applied the fix manually.
+mod m007 {
+    use crate::repo::postgres::PostgresPool;
+    use sqlx::pool::PoolConnection;
+    use sqlx::{Executor, Postgres};
+    use tracing::{info, warn};
+
+    pub const VERSION: i64 = 7;
+
+    /// ASCII bytes for `nosrm007` reinterpreted as a 64-bit integer.
+    const ADVISORY_LOCK_KEY: i64 = 0x6e6f_7372_6d30_3037_i64;
+
+    pub async fn run(db: &PostgresPool) -> crate::error::Result<()> {
+        let mut conn = db.acquire().await?;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(ADVISORY_LOCK_KEY)
+            .execute(&mut conn)
+            .await?;
+
+        let result = run_locked(&mut conn).await;
+
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(ADVISORY_LOCK_KEY)
+            .execute(&mut conn)
+            .await
+        {
+            warn!(
+                "m007: failed to release advisory lock {:#x}: {e}; \
+                 lock will release when connection closes",
+                ADVISORY_LOCK_KEY
+            );
+        }
+
+        result
+    }
+
+    async fn run_locked(conn: &mut PoolConnection<Postgres>) -> crate::error::Result<()> {
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migrations WHERE serial_number = $1")
+                .bind(VERSION)
+                .fetch_one(&mut *conn)
+                .await?;
+        if applied > 0 {
+            return Ok(());
+        }
+
+        info!("m007: creating extended statistics on (kind, pub_key) and (kind, delegated_by)");
+        (&mut *conn)
+            .execute(
+                r#"CREATE STATISTICS IF NOT EXISTS event_kind_pub_key_stats
+   (ndistinct, dependencies, mcv) ON kind, pub_key FROM public."event""#,
+            )
+            .await?;
+        (&mut *conn)
+            .execute(
+                r#"CREATE STATISTICS IF NOT EXISTS event_kind_delegated_by_stats
+   (ndistinct, dependencies, mcv) ON kind, delegated_by FROM public."event""#,
+            )
+            .await?;
+
+        info!("m007: running ANALYZE on event to populate the new statistics (may take ~30s on large tables)");
+        (&mut *conn).execute(r#"ANALYZE public."event""#).await?;
+
+        sqlx::query("INSERT INTO migrations VALUES ($1)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+
+        info!("m007: complete");
         Ok(())
     }
 }
