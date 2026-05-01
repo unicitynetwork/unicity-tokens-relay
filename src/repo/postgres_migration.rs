@@ -478,7 +478,10 @@ mod m006 {
 /// Creating the statistics is cheap; the `ANALYZE` afterwards is what
 /// actually populates them. ANALYZE is non-blocking for reads and
 /// writes but samples the table and can take ~30 s on a multi-million
-/// row event table — startup is delayed by that long the first time.
+/// row event table. The TCP listener doesn't bind until
+/// `run_migrations` returns, so a fresh container is unreachable
+/// during ANALYZE — same situation as m006's CONCURRENTLY index
+/// builds, typically absorbed by the ECS health-check grace period.
 ///
 /// Re-uses the m006 pattern: single connection, session-level
 /// `pg_advisory_lock` to serialize concurrent startups, re-check
