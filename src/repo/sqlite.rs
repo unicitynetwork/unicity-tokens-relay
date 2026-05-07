@@ -159,7 +159,7 @@ impl SqliteRepo {
                 "SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.author=? AND e.kind=? AND e.created_at >= ? LIMIT 1;",
                 params![d_tag, pubkey_blob, e.kind, e.created_at],|row| row.get::<usize, usize>(0));
             // if any rows were returned, then some newer event with
-            // the same author/kind/tag value exist, and we can ignore
+            // the same author/kind/tag value exists, and we can ignore
             // this event.
             if repl_count.ok().is_some() {
                 return Ok(0);
