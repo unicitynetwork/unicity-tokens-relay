@@ -159,29 +159,35 @@ impl NostrRepo for PostgresRepo {
             // clause filters on right-side columns, but it has been observed
             // to lock the planner into an outer-driven nested loop on hot
             // pubkeys (see GH issue #19).
-            let repl_count: i64 = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                sqlx::query_scalar(
-                    "SELECT count(*) AS count FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
+            //
+            // Existence-only probe: `SELECT 1 ... LIMIT 1` + fetch_optional
+            // lets the planner short-circuit on the first match. The earlier
+            // `SELECT count(*) ... LIMIT 1` shape was wrong — LIMIT does not
+            // apply to an aggregate row, so it forced a full count of all
+            // matches even though we only care whether ≥1 row exists.
+            let repl_exists = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
+                sqlx::query(
+                    "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(e.kind as i64)
                     .bind(hex::decode(d_tag).ok())
                     .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-                    .fetch_one(&mut tx)
+                    .fetch_optional(&mut tx)
                     .await?
             } else {
-                sqlx::query_scalar(
-                    "SELECT count(*) AS count FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
+                sqlx::query(
+                    "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(e.kind as i64)
                     .bind(d_tag.as_bytes())
                     .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-                    .fetch_one(&mut tx)
+                    .fetch_optional(&mut tx)
                     .await?
             };
             // if any rows were returned, then some newer event with
-            // the same author/kind/tag value exist, and we can ignore
+            // the same author/kind/tag value exists, and we can ignore
             // this event.
-            if repl_count > 0 {
+            if repl_exists.is_some() {
                 return Ok(0);
             }
         }
