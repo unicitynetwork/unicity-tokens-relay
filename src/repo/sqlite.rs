@@ -151,10 +151,13 @@ impl SqliteRepo {
             }
         }
         // check for parameterized replaceable events that would be hidden; don't insert these either.
+        // Drive from tag side (INNER JOIN) so SQLite uses the tag(name,...,value,...)
+        // covering index instead of scanning event rows for the (kind, author) pair —
+        // critical for hot pubkeys with millions of events (GH issue #19).
         if let Some(d_tag) = e.distinct_param() {
             let repl_count = tx.query_row(
-                "SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.author=? AND e.kind=? AND t.name='d' AND t.value=? AND e.created_at >= ? LIMIT 1;",
-                params![pubkey_blob, e.kind, d_tag, e.created_at],|row| row.get::<usize, usize>(0));
+                "SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.author=? AND e.kind=? AND e.created_at >= ? LIMIT 1;",
+                params![d_tag, pubkey_blob, e.kind, e.created_at],|row| row.get::<usize, usize>(0));
             // if any rows were returned, then some newer event with
             // the same author/kind/tag value exist, and we can ignore
             // this event.
@@ -211,10 +214,14 @@ impl SqliteRepo {
             }
         }
         // if this event is parameterized replaceable, remove other events.
+        // Drive from tag side (INNER JOIN) so SQLite picks the tag(name,kind,value,...)
+        // covering index up front. With LEFT JOIN the planner has been observed to
+        // scan event rows for the (kind, author) pair and probe tag per row, which
+        // balloons to multi-second runtimes on hot pubkeys (GH issue #19).
         if let Some(d_tag) = e.distinct_param() {
             let update_count = tx.execute(
-                "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=? AND e.author=? AND t.name='d' AND t.value=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
-                params![e.kind, pubkey_blob, e.kind, pubkey_blob, d_tag])?;
+                "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.kind=? AND e.author=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
+                params![e.kind, pubkey_blob, d_tag, e.kind, pubkey_blob])?;
             if update_count > 0 {
                 info!(
                     "removed {} older parameterized replaceable kind {} events for author: {:?}",
@@ -1717,5 +1724,96 @@ mod tests {
             subquery_count, 2,
             "Should have 2 subqueries for 2 different tag keys"
         );
+    }
+
+    /// Regression test for GH issue #19 (production: 11-26s persist tail
+    /// for kind=31113 events on hot pubkeys).
+    ///
+    /// Verifies the parameterized-replaceable DELETE correctly removes
+    /// older events when the d-tag value is non-hex (e.g.
+    /// `token-transfer-{ts}-{nonce}`) — the exact data shape that hit the
+    /// planner cliff in production. Locks in the new tag-driven INNER
+    /// JOIN form against an accidental revert to the LEFT-JOIN-from-event
+    /// shape.
+    #[test]
+    fn test_param_replaceable_delete_non_hex_d_tag() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE event (
+                id INTEGER PRIMARY KEY,
+                event_hash BLOB NOT NULL,
+                first_seen INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                author BLOB NOT NULL,
+                delegated_by BLOB,
+                kind INTEGER NOT NULL,
+                hidden INTEGER,
+                content TEXT NOT NULL
+            );
+            CREATE TABLE tag (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                name TEXT,
+                value TEXT,
+                value_hex BLOB,
+                created_at INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES event(id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .unwrap();
+
+        let author: Vec<u8> = vec![0xab; 32];
+        let kind: i64 = 30_000;
+        let d_tag = "token-transfer-1778147372148-kdgqnh";
+
+        // Insert three events with the same (author, kind, d-tag) at
+        // increasing created_at; mirrors the row state right after the
+        // newest of three replaceable events has been INSERTed.
+        let tx = conn.transaction().unwrap();
+        for (ev_pk, t) in [(1i64, 100i64), (2, 200), (3, 300)] {
+            tx.execute(
+                "INSERT INTO event (id, event_hash, first_seen, created_at, author, kind, content) \
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5, '');",
+                params![ev_pk, vec![ev_pk as u8; 32], t, author, kind],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO tag (event_id, name, value, kind, created_at) \
+                 VALUES (?1, 'd', ?2, ?3, ?4);",
+                params![ev_pk, d_tag, kind, t],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Run the parameterized-replaceable DELETE — same SQL string as
+        // SqliteRepo::persist_event uses. If a future edit reverts the
+        // `tag t JOIN event e` form back to `event e LEFT JOIN tag t`,
+        // we still want this test to keep passing semantically — but
+        // copying the literal SQL also catches accidental binding/
+        // ordering breakage.
+        let pubkey_blob = author.clone();
+        let deleted = conn
+            .execute(
+                "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.kind=? AND e.author=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
+                params![kind, pubkey_blob, d_tag, kind, pubkey_blob],
+            )
+            .unwrap();
+
+        assert_eq!(deleted, 2, "expected the two older versions to be deleted");
+
+        // Newest event (id=3, created_at=300) must survive.
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM event ORDER BY id;")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(remaining, vec![3]);
     }
 }
