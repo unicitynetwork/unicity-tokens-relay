@@ -160,49 +160,50 @@ impl NostrRepo for PostgresRepo {
                 return Ok(0);
             }
         }
-        if let Some(d_tag) = e.distinct_param().filter(|_| !self.skip_dedup_kinds.contains(&e.kind)) {
-            // Drive from tag (highly selective on value/value_hex) and use
-            // INNER JOIN so the planner can pick a tag-index-driven plan
-            // instead of scanning event rows for the (kind, pub_key) pair.
-            // LEFT JOIN here is semantically equivalent because the WHERE
-            // clause filters on right-side columns, but it has been observed
-            // to lock the planner into an outer-driven nested loop on hot
-            // pubkeys (see GH issue #19).
-            //
-            // Existence-only probe: `SELECT 1 ... LIMIT 1` + fetch_optional
-            // lets the planner short-circuit on the first match. The earlier
-            // `SELECT count(*) ... LIMIT 1` shape was wrong — LIMIT does not
-            // apply to an aggregate row, so it forced a full count of all
-            // matches even though we only care whether ≥1 row exists.
-            //
-            // Operators can opt a kind out of NIP-33 dedup entirely via
-            // `database.nip33_skip_dedup_kinds` — see issue #21. The
-            // `.filter()` above bypasses both this existence check and the
-            // post-INSERT DELETE block below for matching kinds.
-            let repl_exists = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                sqlx::query(
-                    "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
-                    .bind(hex::decode(&e.pubkey).ok())
-                    .bind(e.kind as i64)
-                    .bind(hex::decode(d_tag).ok())
-                    .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-                    .fetch_optional(&mut tx)
-                    .await?
-            } else {
-                sqlx::query(
-                    "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
-                    .bind(hex::decode(&e.pubkey).ok())
-                    .bind(e.kind as i64)
-                    .bind(d_tag.as_bytes())
-                    .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-                    .fetch_optional(&mut tx)
-                    .await?
-            };
-            // if any rows were returned, then some newer event with
-            // the same author/kind/tag value exists, and we can ignore
-            // this event.
-            if repl_exists.is_some() {
-                return Ok(0);
+        // Operators can opt a kind out of NIP-33 dedup entirely via
+        // `database.nip33_skip_dedup_kinds` — see issue #21. Check the
+        // skip set *before* `distinct_param()` so a configured kind
+        // also skips the tag scan, matching the SQLite path.
+        if !self.skip_dedup_kinds.contains(&e.kind) {
+            if let Some(d_tag) = e.distinct_param() {
+                // Drive from tag (highly selective on value/value_hex) and use
+                // INNER JOIN so the planner can pick a tag-index-driven plan
+                // instead of scanning event rows for the (kind, pub_key) pair.
+                // LEFT JOIN here is semantically equivalent because the WHERE
+                // clause filters on right-side columns, but it has been observed
+                // to lock the planner into an outer-driven nested loop on hot
+                // pubkeys (see GH issue #19).
+                //
+                // Existence-only probe: `SELECT 1 ... LIMIT 1` + fetch_optional
+                // lets the planner short-circuit on the first match. The earlier
+                // `SELECT count(*) ... LIMIT 1` shape was wrong — LIMIT does not
+                // apply to an aggregate row, so it forced a full count of all
+                // matches even though we only care whether ≥1 row exists.
+                let repl_exists = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
+                    sqlx::query(
+                        "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
+                        .bind(hex::decode(&e.pubkey).ok())
+                        .bind(e.kind as i64)
+                        .bind(hex::decode(d_tag).ok())
+                        .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+                        .fetch_optional(&mut tx)
+                        .await?
+                } else {
+                    sqlx::query(
+                        "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
+                        .bind(hex::decode(&e.pubkey).ok())
+                        .bind(e.kind as i64)
+                        .bind(d_tag.as_bytes())
+                        .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+                        .fetch_optional(&mut tx)
+                        .await?
+                };
+                // if any rows were returned, then some newer event with
+                // the same author/kind/tag value exists, and we can ignore
+                // this event.
+                if repl_exists.is_some() {
+                    return Ok(0);
+                }
             }
         }
         // ignore if the event hash is a duplicate.
@@ -279,37 +280,41 @@ ON CONFLICT (id) DO NOTHING"#,
         }
         // parameterized replaceable events
         // check for parameterized replaceable events that would be hidden; don't insert these either.
-        // Skipped entirely for kinds in `nip33_skip_dedup_kinds` (issue #21).
-        if let Some(d_tag) = e.distinct_param().filter(|_| !self.skip_dedup_kinds.contains(&e.kind)) {
-            // Drive the inner subquery from tag (see comment above on the
-            // existence-check query). With LEFT JOIN, the planner has been
-            // observed to scan millions of event rows for a hot pubkey and
-            // probe tag per row even when the result set is empty, causing
-            // multi-second persists on kind=3xxxx events. INNER JOIN with
-            // tag-first FROM lets the planner use the tag(value_hex) /
-            // tag(value) index up front (GH issue #19).
-            let update_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
-                    .bind(e.kind as i64)
-                    .bind(hex::decode(&e.pubkey).ok())
-                    .bind(hex::decode(d_tag).ok())
-                    .execute(&mut tx)
-                    .await?.rows_affected()
-            } else {
-                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
-                    .bind(e.kind as i64)
-                    .bind(hex::decode(&e.pubkey).ok())
-                    .bind(d_tag.as_bytes())
-                    .execute(&mut tx)
-                    .await?.rows_affected()
-            };
-            if update_count > 0 {
-                info!(
-                    "removed {} older parameterized replaceable kind {} events for author: {:?}",
-                    update_count,
-                    e.kind,
-                    e.get_author_prefix()
-                );
+        // Skipped entirely for kinds in `nip33_skip_dedup_kinds` (issue
+        // #21). Skip-set check first so configured kinds also avoid
+        // the `distinct_param()` tag scan.
+        if !self.skip_dedup_kinds.contains(&e.kind) {
+            if let Some(d_tag) = e.distinct_param() {
+                // Drive the inner subquery from tag (see comment above on the
+                // existence-check query). With LEFT JOIN, the planner has been
+                // observed to scan millions of event rows for a hot pubkey and
+                // probe tag per row even when the result set is empty, causing
+                // multi-second persists on kind=3xxxx events. INNER JOIN with
+                // tag-first FROM lets the planner use the tag(value_hex) /
+                // tag(value) index up front (GH issue #19).
+                let update_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
+                    sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
+                        .bind(e.kind as i64)
+                        .bind(hex::decode(&e.pubkey).ok())
+                        .bind(hex::decode(d_tag).ok())
+                        .execute(&mut tx)
+                        .await?.rows_affected()
+                } else {
+                    sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
+                        .bind(e.kind as i64)
+                        .bind(hex::decode(&e.pubkey).ok())
+                        .bind(d_tag.as_bytes())
+                        .execute(&mut tx)
+                        .await?.rows_affected()
+                };
+                if update_count > 0 {
+                    info!(
+                        "removed {} older parameterized replaceable kind {} events for author: {:?}",
+                        update_count,
+                        e.kind,
+                        e.get_author_prefix()
+                    );
+                }
             }
         }
         // if this event is a deletion, hide the referenced events from the same author.
