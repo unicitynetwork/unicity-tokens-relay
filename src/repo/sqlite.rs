@@ -1726,15 +1726,18 @@ mod tests {
         );
     }
 
-    /// Regression test for GH issue #19 (production: 11-26s persist tail
-    /// for kind=31113 events on hot pubkeys).
+    /// Semantic regression test for GH issue #19 (production: 11-26s
+    /// persist tail for kind=31113 events on hot pubkeys).
     ///
-    /// Verifies the parameterized-replaceable DELETE correctly removes
-    /// older events when the d-tag value is non-hex (e.g.
-    /// `token-transfer-{ts}-{nonce}`) — the exact data shape that hit the
-    /// planner cliff in production. Locks in the new tag-driven INNER
-    /// JOIN form against an accidental revert to the LEFT-JOIN-from-event
-    /// shape.
+    /// Runs the same tag-driven INNER JOIN DELETE shape that
+    /// `persist_event` ships, against the exact non-hex d-tag value seen
+    /// in production (`token-transfer-{ts}-{nonce}`), and verifies older
+    /// rows are removed while the newest survives.
+    ///
+    /// This test does not call `persist_event` directly, so it cannot
+    /// catch a revert that changes only the SQL string in source. It is
+    /// a check on the DELETE's *semantics* — that the tag-first INNER
+    /// JOIN form correctly matches non-hex `value`-column rows.
     #[test]
     fn test_param_replaceable_delete_non_hex_d_tag() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
