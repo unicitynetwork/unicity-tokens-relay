@@ -694,7 +694,7 @@ async fn ctrl_c_or_signal(mut shutdown_signal: Receiver<()>) {
     }
 }
 
-fn create_metrics() -> (Registry, NostrMetrics) {
+pub(crate) fn create_metrics() -> (Registry, NostrMetrics) {
     // setup prometheus registry
     let registry = Registry::new();
 

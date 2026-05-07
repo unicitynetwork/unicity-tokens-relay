@@ -112,7 +112,20 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
     };
     metrics.db_pool_size.set(db_pool_size);
 
-    let repo = PostgresRepo::new(pool, write_pool, metrics, separate_write_pool);
+    let skip_dedup_kinds: std::collections::HashSet<u64> = settings
+        .database
+        .nip33_skip_dedup_kinds
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let repo = PostgresRepo::new(
+        pool,
+        write_pool,
+        metrics,
+        separate_write_pool,
+        skip_dedup_kinds,
+    );
 
     // Panic on migration failure
     let version = repo.migrate_up().await.unwrap();

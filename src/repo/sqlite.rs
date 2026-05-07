@@ -30,6 +30,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::repo::{now_jitter, NostrRepo};
 use nostr::key::Keys;
+use std::collections::HashSet;
 
 pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 pub type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
@@ -51,6 +52,11 @@ pub struct SqliteRepo {
     write_in_progress: Arc<Mutex<u64>>,
     /// Semaphore for readers to acquire blocking threads
     reader_threads_ready: Arc<Semaphore>,
+    /// Event kinds for which the relay skips NIP-33 dedup (existence
+    /// check + DELETE). Populated from
+    /// `database.nip33_skip_dedup_kinds` at construction. Empty set
+    /// (default) preserves canonical NIP-33 behavior. See issue #21.
+    skip_dedup_kinds: Arc<HashSet<u64>>,
 }
 
 impl SqliteRepo {
@@ -91,6 +97,15 @@ impl SqliteRepo {
         // to match the number of database reader connections.
         let max_conn = settings.database.max_conn as usize;
         let reader_threads_ready = Arc::new(Semaphore::new(max_conn));
+        let skip_dedup_kinds = Arc::new(
+            settings
+                .database
+                .nip33_skip_dedup_kinds
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<u64>>(),
+        );
         SqliteRepo {
             metrics,
             read_pool,
@@ -99,6 +114,7 @@ impl SqliteRepo {
             checkpoint_in_progress,
             write_in_progress,
             reader_threads_ready,
+            skip_dedup_kinds,
         }
     }
 
@@ -129,7 +145,15 @@ impl SqliteRepo {
     }
 
     /// Persist an event to the database, returning rows added.
-    pub fn persist_event(conn: &mut PooledConnection, e: &Event) -> Result<u64> {
+    ///
+    /// `skip_dedup_kinds` is the set of event kinds for which to bypass
+    /// NIP-33 parameterized-replaceable dedup (see issue #21). Pass an
+    /// empty set to preserve canonical behavior.
+    pub fn persist_event(
+        conn: &mut PooledConnection,
+        e: &Event,
+        skip_dedup_kinds: &HashSet<u64>,
+    ) -> Result<u64> {
         // enable auto vacuum
         conn.execute_batch("pragma auto_vacuum = FULL")?;
 
@@ -154,15 +178,22 @@ impl SqliteRepo {
         // Drive from tag side (INNER JOIN) so SQLite uses the tag(name,...,value,...)
         // covering index instead of scanning event rows for the (kind, author) pair —
         // critical for hot pubkeys with millions of events (GH issue #19).
-        if let Some(d_tag) = e.distinct_param() {
-            let repl_count = tx.query_row(
-                "SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.author=? AND e.kind=? AND e.created_at >= ? LIMIT 1;",
-                params![d_tag, pubkey_blob, e.kind, e.created_at],|row| row.get::<usize, usize>(0));
-            // if any rows were returned, then some newer event with
-            // the same author/kind/tag value exists, and we can ignore
-            // this event.
-            if repl_count.ok().is_some() {
-                return Ok(0);
+        //
+        // Operators can opt a kind out of NIP-33 dedup entirely via
+        // `database.nip33_skip_dedup_kinds` for kinds whose `d` is
+        // unique by construction; the queries below are no-ops in that
+        // case but still consume DB resources (issue #21).
+        if !skip_dedup_kinds.contains(&e.kind) {
+            if let Some(d_tag) = e.distinct_param() {
+                let repl_count = tx.query_row(
+                    "SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.author=? AND e.kind=? AND e.created_at >= ? LIMIT 1;",
+                    params![d_tag, pubkey_blob, e.kind, e.created_at],|row| row.get::<usize, usize>(0));
+                // if any rows were returned, then some newer event with
+                // the same author/kind/tag value exists, and we can ignore
+                // this event.
+                if repl_count.ok().is_some() {
+                    return Ok(0);
+                }
             }
         }
         // ignore if the event hash is a duplicate.
@@ -218,17 +249,22 @@ impl SqliteRepo {
         // covering index up front. With LEFT JOIN the planner has been observed to
         // scan event rows for the (kind, author) pair and probe tag per row, which
         // balloons to multi-second runtimes on hot pubkeys (GH issue #19).
-        if let Some(d_tag) = e.distinct_param() {
-            let update_count = tx.execute(
-                "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.kind=? AND e.author=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
-                params![e.kind, pubkey_blob, d_tag, e.kind, pubkey_blob])?;
-            if update_count > 0 {
-                info!(
-                    "removed {} older parameterized replaceable kind {} events for author: {:?}",
-                    update_count,
-                    e.kind,
-                    e.get_author_prefix()
-                );
+        //
+        // Skipped entirely for kinds in `nip33_skip_dedup_kinds`
+        // (issue #21).
+        if !skip_dedup_kinds.contains(&e.kind) {
+            if let Some(d_tag) = e.distinct_param() {
+                let update_count = tx.execute(
+                    "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=? AND e.kind=? AND e.author=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
+                    params![e.kind, pubkey_blob, d_tag, e.kind, pubkey_blob])?;
+                if update_count > 0 {
+                    info!(
+                        "removed {} older parameterized replaceable kind {} events for author: {:?}",
+                        update_count,
+                        e.kind,
+                        e.get_author_prefix()
+                    );
+                }
             }
         }
         // if this event is a deletion, hide the referenced events from the same author.
@@ -313,13 +349,14 @@ impl NostrRepo for SqliteRepo {
         //let mut conn = self.write_pool.get()?;
         let pool = self.write_pool.clone();
         let e = e.clone();
+        let skip = self.skip_dedup_kinds.clone();
         let event_count = task::spawn_blocking(move || {
             let mut conn = pool.get()?;
             // this could fail because the database was busy; try
             // multiple times before giving up.
             loop {
                 attempts += 1;
-                let wr = SqliteRepo::persist_event(&mut conn, &e);
+                let wr = SqliteRepo::persist_event(&mut conn, &e, &skip);
                 match wr {
                     Err(SqlError(rusqlite::Error::SqliteFailure(e, _))) => {
                         // this basically means that NIP-05 or another
@@ -1818,5 +1855,78 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(remaining, vec![3]);
+    }
+
+    /// Issue #21 — config-driven NIP-33 dedup bypass.
+    ///
+    /// Drives `SqliteRepo::persist_event` directly through 3 sequential
+    /// writes of the same `(author, kind=31113, d="token-transfer-...")`
+    /// triple, with `kind=31113` placed in the skip set. With dedup
+    /// bypassed, all 3 events must persist (no DELETE removes prior
+    /// versions). Without the bypass, only the newest would survive —
+    /// the existing `test_param_replaceable_delete_non_hex_d_tag`
+    /// covers that path.
+    #[test]
+    fn test_param_replaceable_dedup_bypass_for_skipped_kind() {
+        use crate::config::Settings;
+
+        let mut settings = Settings::default();
+        settings.database.in_memory = true;
+        settings.database.min_conn = 1;
+        settings.database.max_conn = 2;
+        settings.database.nip33_skip_dedup_kinds = Some(vec![31113]);
+
+        // Reuse the same metrics constructor the server uses, against
+        // a fresh prometheus registry, so we don't reimplement the
+        // (large) NostrMetrics shape here.
+        let (_registry, metrics) = crate::server::create_metrics();
+
+        let repo = SqliteRepo::new(&settings, metrics);
+        // Use a write-pool connection directly so we can run
+        // `persist_event` synchronously, mirroring the production write
+        // path without spinning up the async runtime.
+        let mut conn = repo.write_pool.get().unwrap();
+        upgrade_db(&mut conn).expect("schema upgrade");
+
+        let pubkey_hex = "ab".repeat(32);
+        let d_value = "token-transfer-1778147372148-kdgqnh";
+
+        // Three back-to-back persists of the same (author, kind, d)
+        // with monotonically increasing created_at. Each event needs
+        // a unique id so the `event_hash` UNIQUE constraint doesn't
+        // collapse them into one row before dedup even runs.
+        for (i, ts) in [(1u8, 100u64), (2, 200), (3, 300)] {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[0] = i;
+            let event = Event {
+                id: hex::encode(id_bytes),
+                pubkey: pubkey_hex.clone(),
+                created_at: ts,
+                kind: 31113,
+                tags: vec![vec!["d".to_string(), d_value.to_string()]],
+                content: format!("event-{i}"),
+                sig: "00".repeat(64),
+                delegated_by: None,
+                tagidx: None,
+            };
+            let count = SqliteRepo::persist_event(&mut conn, &event, &repo.skip_dedup_kinds)
+                .expect("persist");
+            assert_eq!(count, 1, "each persist should insert one row");
+        }
+
+        // All three should still be present — the bypass kept the
+        // existence check from rejecting later events and the DELETE
+        // from removing earlier ones.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM event WHERE kind=31113;",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 3,
+            "bypass must keep all 3 versions; got {remaining}"
+        );
     }
 }

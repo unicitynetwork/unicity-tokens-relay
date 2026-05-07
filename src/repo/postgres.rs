@@ -17,7 +17,9 @@ use nostr::key::Keys;
 use sqlx::postgres::PgRow;
 use sqlx::Error::RowNotFound;
 use sqlx::{Error, Execute, FromRow, Postgres, QueryBuilder, Row};
+use std::collections::HashSet;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver;
@@ -35,6 +37,11 @@ pub struct PostgresRepo {
     /// — pool metrics must read from one of them only, otherwise the
     /// in-use count would double-count the shared pool.
     separate_write_pool: bool,
+    /// Event kinds for which the relay skips NIP-33 dedup (existence
+    /// check + DELETE). Populated from
+    /// `database.nip33_skip_dedup_kinds` at construction. Empty set
+    /// (default) preserves canonical NIP-33 behavior. See issue #21.
+    skip_dedup_kinds: Arc<HashSet<u64>>,
 }
 
 impl PostgresRepo {
@@ -43,12 +50,14 @@ impl PostgresRepo {
         cw: PostgresPool,
         m: NostrMetrics,
         separate_write_pool: bool,
+        skip_dedup_kinds: HashSet<u64>,
     ) -> PostgresRepo {
         PostgresRepo {
             conn: c,
             conn_write: cw,
             metrics: m,
             separate_write_pool,
+            skip_dedup_kinds: Arc::new(skip_dedup_kinds),
         }
     }
 
@@ -151,7 +160,7 @@ impl NostrRepo for PostgresRepo {
                 return Ok(0);
             }
         }
-        if let Some(d_tag) = e.distinct_param() {
+        if let Some(d_tag) = e.distinct_param().filter(|_| !self.skip_dedup_kinds.contains(&e.kind)) {
             // Drive from tag (highly selective on value/value_hex) and use
             // INNER JOIN so the planner can pick a tag-index-driven plan
             // instead of scanning event rows for the (kind, pub_key) pair.
@@ -165,6 +174,11 @@ impl NostrRepo for PostgresRepo {
             // `SELECT count(*) ... LIMIT 1` shape was wrong — LIMIT does not
             // apply to an aggregate row, so it forced a full count of all
             // matches even though we only care whether ≥1 row exists.
+            //
+            // Operators can opt a kind out of NIP-33 dedup entirely via
+            // `database.nip33_skip_dedup_kinds` — see issue #21. The
+            // `.filter()` above bypasses both this existence check and the
+            // post-INSERT DELETE block below for matching kinds.
             let repl_exists = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
                 sqlx::query(
                     "SELECT 1 FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
@@ -265,7 +279,8 @@ ON CONFLICT (id) DO NOTHING"#,
         }
         // parameterized replaceable events
         // check for parameterized replaceable events that would be hidden; don't insert these either.
-        if let Some(d_tag) = e.distinct_param() {
+        // Skipped entirely for kinds in `nip33_skip_dedup_kinds` (issue #21).
+        if let Some(d_tag) = e.distinct_param().filter(|_| !self.skip_dedup_kinds.contains(&e.kind)) {
             // Drive the inner subquery from tag (see comment above on the
             // existence-check query). With LEFT JOIN, the planner has been
             // observed to scan millions of event rows for a hot pubkey and

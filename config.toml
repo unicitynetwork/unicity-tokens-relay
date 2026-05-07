@@ -63,6 +63,16 @@ description = "A newly created nostr-rs-relay.\n\nCustomize this with your own i
 # different nodes.  Ignore for single-database instances.
 #connection_write = "postgresql://postgres:nostr@localhost:7500/nostr"
 
+# Event kinds for which the relay should skip NIP-33 dedup work
+# (the pre-INSERT "is there a newer version?" check and the
+# post-INSERT "delete older versions" DELETE). Set this only for
+# kinds whose `d` tag is guaranteed unique by construction — the
+# dedup queries are no-ops in that case but still consume DB
+# resources on every persist. With this set, NIP-33 enforcement
+# becomes the publisher's / SDK's responsibility for these kinds.
+# Default: dedup runs for every parameterized-replaceable event (kinds 30000-39999).
+#nip33_skip_dedup_kinds = [31113]
+
 [logging]
 # Directory to store log files.  Log files roll over daily.
 #folder_path = "./log"

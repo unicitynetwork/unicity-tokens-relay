@@ -27,6 +27,13 @@ pub struct Database {
     pub max_conn: u32,
     pub connection: String,
     pub connection_write: Option<String>,
+    /// Event kinds for which the relay should skip NIP-33
+    /// parameterized-replaceable dedup (the pre-INSERT existence check
+    /// and the post-INSERT DELETE of older versions). Intended for
+    /// applications that guarantee `d`-tag uniqueness by construction
+    /// — the dedup queries are no-ops in that case but still consume
+    /// DB resources on every persist. See issue #21.
+    pub nip33_skip_dedup_kinds: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +324,7 @@ impl Default for Settings {
                 max_conn: 8,
                 connection: "".to_owned(),
                 connection_write: None,
+                nip33_skip_dedup_kinds: None,
             },
             grpc: Grpc {
                 event_admission_server: None,
@@ -493,5 +501,35 @@ ws_write_timeout_seconds = 0
             }
             other => panic!("expected ConfigError::Message for zero ws write timeout, got {other:?}"),
         }
+    }
+
+    /// Issue #21: `database.nip33_skip_dedup_kinds` must round-trip
+    /// through TOML loading and end up on the parsed `Settings`.
+    #[test]
+    fn nip33_skip_dedup_kinds_loads_from_toml() {
+        let path = write_temp_config(
+            r#"
+[database]
+nip33_skip_dedup_kinds = [31113, 31114]
+"#,
+        );
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        let settings = result.expect("valid skip-dedup list should load");
+        assert_eq!(
+            settings.database.nip33_skip_dedup_kinds,
+            Some(vec![31113, 31114])
+        );
+    }
+
+    /// Issue #21: when the key is absent, the field stays `None` so the
+    /// repos preserve canonical NIP-33 dedup behavior by default.
+    #[test]
+    fn nip33_skip_dedup_kinds_defaults_to_none() {
+        let path = write_temp_config("");
+        let result = Settings::new(&Some(path.to_string_lossy().to_string()));
+        std::fs::remove_file(&path).ok();
+        let settings = result.expect("empty config should load with defaults");
+        assert!(settings.database.nip33_skip_dedup_kinds.is_none());
     }
 }
