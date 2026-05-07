@@ -152,9 +152,16 @@ impl NostrRepo for PostgresRepo {
             }
         }
         if let Some(d_tag) = e.distinct_param() {
+            // Drive from tag (highly selective on value/value_hex) and use
+            // INNER JOIN so the planner can pick a tag-index-driven plan
+            // instead of scanning event rows for the (kind, pub_key) pair.
+            // LEFT JOIN here is semantically equivalent because the WHERE
+            // clause filters on right-side columns, but it has been observed
+            // to lock the planner into an outer-driven nested loop on hot
+            // pubkeys (see GH issue #19).
             let repl_count: i64 = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
                 sqlx::query_scalar(
-                    "SELECT count(*) AS count FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.pub_key=$1 AND e.kind=$2 AND t.name='d' AND t.value_hex=$3 AND e.created_at >= $4 LIMIT 1;")
+                    "SELECT count(*) AS count FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(e.kind as i64)
                     .bind(hex::decode(d_tag).ok())
@@ -163,7 +170,7 @@ impl NostrRepo for PostgresRepo {
                     .await?
             } else {
                 sqlx::query_scalar(
-                    "SELECT count(*) AS count FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.pub_key=$1 AND e.kind=$2 AND t.name='d' AND t.value=$3 AND e.created_at >= $4 LIMIT 1;")
+                    "SELECT count(*) AS count FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $4 LIMIT 1;")
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(e.kind as i64)
                     .bind(d_tag.as_bytes())
@@ -253,15 +260,22 @@ ON CONFLICT (id) DO NOTHING"#,
         // parameterized replaceable events
         // check for parameterized replaceable events that would be hidden; don't insert these either.
         if let Some(d_tag) = e.distinct_param() {
+            // Drive the inner subquery from tag (see comment above on the
+            // existence-check query). With LEFT JOIN, the planner has been
+            // observed to scan millions of event rows for a hot pubkey and
+            // probe tag per row even when the result set is empty, causing
+            // multi-second persists on kind=3xxxx events. INNER JOIN with
+            // tag-first FROM lets the planner use the tag(value_hex) /
+            // tag(value) index up front (GH issue #19).
             let update_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=$1 AND e.pub_key=$2 AND t.name='d' AND t.value_hex=$3 ORDER BY created_at DESC OFFSET 1);")
+                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value_hex=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
                     .bind(e.kind as i64)
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(hex::decode(d_tag).ok())
                     .execute(&mut tx)
                     .await?.rows_affected()
             } else {
-                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=$1 AND e.pub_key=$2 AND t.name='d' AND t.value=$3 ORDER BY created_at DESC OFFSET 1);")
+                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM tag t JOIN event e ON e.id=t.event_id WHERE t.name='d' AND t.value=$3 AND e.kind=$1 AND e.pub_key=$2 ORDER BY e.created_at DESC OFFSET 1);")
                     .bind(e.kind as i64)
                     .bind(hex::decode(&e.pubkey).ok())
                     .bind(d_tag.as_bytes())
