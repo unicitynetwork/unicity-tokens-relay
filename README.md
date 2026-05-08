@@ -1,17 +1,17 @@
-# [nostr-rs-relay](https://git.sr.ht/~gheartsfield/nostr-rs-relay)
+# [Unicity Tokens Relay](https://github.com/unicitynetwork/unicity-tokens-relay)
 
-This is a [nostr](https://github.com/nostr-protocol/nostr) relay,
-written in Rust.  It currently supports the entire relay protocol, and
-persists data with SQLite.  There is experimental support for
-Postgresql.
+A [nostr](https://github.com/nostr-protocol/nostr) relay used by Unicity
+for token transfers and identity bindings. Forked from
+[`nostr-rs-relay`](https://git.sr.ht/~gheartsfield/nostr-rs-relay) by
+@scsibug; this fork adds production hardening (delivery-side
+observability, Postgres tuning, NIP-33 dedup controls) and tracks the
+upstream protocol implementation.
 
-The project master repository is available on
-[sourcehut](https://sr.ht/~gheartsfield/nostr-rs-relay/), and is
-mirrored on [GitHub](https://github.com/scsibug/nostr-rs-relay).
+Upstream: canonical source at
+[sourcehut](https://sr.ht/~gheartsfield/nostr-rs-relay/), GitHub mirror
+at [scsibug/nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay).
 
-[![builds.sr.ht status](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master.svg)](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master?)
-
-![Github CI](https://github.com/scsibug/nostr-rs-relay/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/unicitynetwork/unicity-tokens-relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/unicitynetwork/unicity-tokens-relay/actions/workflows/ci.yml?query=branch%3Amain)
 
 
 ## Features
@@ -86,8 +86,8 @@ Text Note [81cf...2652] from 296a...9b92 5 seconds ago
   hello world
 ```
 
-A pre-built container is also available on DockerHub:
-https://hub.docker.com/r/scsibug/nostr-rs-relay
+A pre-built container is published to GitHub Container Registry:
+[`ghcr.io/unicitynetwork/unicity-tokens-relay`](https://github.com/unicitynetwork/unicity-tokens-relay/pkgs/container/unicity-tokens-relay)
 
 ## Build and Run (without Docker)
 
@@ -106,8 +106,8 @@ $ doas pkg_add rust protobuf
 Clone this repository, and then build a release version of the relay:
 
 ```console
-$ git clone -q https://git.sr.ht/\~gheartsfield/nostr-rs-relay
-$ cd nostr-rs-relay
+$ git clone -q https://github.com/unicitynetwork/unicity-tokens-relay
+$ cd unicity-tokens-relay
 $ cargo build -q -r
 ```
 
@@ -156,8 +156,10 @@ Proxy](docs/reverse-proxy.md).
 
 ## Dev Channel
 
-For development discussions, please feel free to use the [sourcehut
-mailing list](https://lists.sr.ht/~gheartsfield/nostr-rs-relay-devel).
+Open an issue or pull request on
+[GitHub](https://github.com/unicitynetwork/unicity-tokens-relay/issues)
+for fork-specific discussion. Upstream protocol-level work happens on
+the [sourcehut mailing list](https://lists.sr.ht/~gheartsfield/nostr-rs-relay-devel).
 
 License
 ---
