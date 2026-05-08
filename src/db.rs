@@ -35,6 +35,29 @@ pub struct SubmittedEvent {
     pub auth_pubkey: Option<Vec<u8>>,
 }
 
+/// An event being fanned out from the db writer to subscribed connections.
+///
+/// Carries the broadcast send timestamp so each subscriber can observe
+/// delivery latency (`nostr_event_delivery_latency_seconds`) from the
+/// moment the writer published the event to the moment it was actually
+/// written to that subscriber's WebSocket. Without this, a slow consumer
+/// keeping the broadcast channel saturated is invisible until users
+/// complain.
+#[derive(Clone)]
+pub struct BroadcastEvent {
+    pub event: Event,
+    pub broadcast_at: Instant,
+}
+
+impl BroadcastEvent {
+    pub fn new(event: Event) -> Self {
+        Self {
+            event,
+            broadcast_at: Instant::now(),
+        }
+    }
+}
+
 /// Database file
 pub const DB_FILE: &str = "nostr.db";
 
@@ -129,7 +152,7 @@ pub struct DbWriterContext {
     pub repo: Arc<dyn NostrRepo>,
     pub settings: Settings,
     pub event_rx: tokio::sync::mpsc::Receiver<SubmittedEvent>,
-    pub bcast_tx: tokio::sync::broadcast::Sender<Event>,
+    pub bcast_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
     pub metadata_tx: tokio::sync::broadcast::Sender<Event>,
     pub payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
     pub shutdown: tokio::sync::broadcast::Receiver<()>,
@@ -480,7 +503,7 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
         // TODO: cache recent list of authors to remove a DB call.
         let start = Instant::now();
         if event.is_ephemeral() {
-            bcast_tx.send(event.clone()).ok();
+            bcast_tx.send(BroadcastEvent::new(event.clone())).ok();
             debug!(
                 "published ephemeral event: {:?} from: {:?} in: {:?}",
                 event.get_event_id_prefix(),
@@ -524,7 +547,7 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
                             .with_label_values(&[&event.kind.to_string()])
                             .inc();
                         // send this out to all clients
-                        bcast_tx.send(event.clone()).ok();
+                        bcast_tx.send(BroadcastEvent::new(event.clone())).ok();
                         notice_tx.try_send(Notice::saved(event.id)).ok();
                     }
                 }

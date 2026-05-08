@@ -4,6 +4,7 @@ use crate::close::CloseCmd;
 use crate::config::{Settings, VerifiedUsersMode};
 use crate::conn;
 use crate::db;
+use crate::db::BroadcastEvent;
 use crate::db::SubmittedEvent;
 use crate::error::{Error, Result};
 use crate::event::Event;
@@ -71,7 +72,7 @@ async fn handle_web_request(
     repo: Arc<dyn NostrRepo>,
     settings: Settings,
     remote_addr: SocketAddr,
-    broadcast: Sender<Event>,
+    broadcast: Sender<BroadcastEvent>,
     event_tx: tokio::sync::mpsc::Sender<SubmittedEvent>,
     payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
     shutdown: Receiver<()>,
@@ -727,7 +728,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     .unwrap();
     let write_events = Histogram::with_opts(
         HistogramOpts::new("nostr_events_write_seconds", "Event writing response times")
-            .buckets(latency_buckets),
+            .buckets(latency_buckets.clone()),
     )
     .unwrap();
     let sent_events = IntCounterVec::new(
@@ -819,10 +820,43 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         vec!["kind"].as_slice(),
     )
     .unwrap();
+    // Per-kind count of events queued for delivery to a subscriber on the
+    // realtime path (one increment per matching subscription per connection).
+    // Pairs with `nostr_events_persisted_by_kind_total` to expose delivery
+    // fan-out — a sustained drop in the ratio means broadcasts are not
+    // reaching open subs.
+    let events_delivered_by_kind = IntCounterVec::new(
+        Opts::new(
+            "nostr_events_delivered_total",
+            "Events queued for delivery to subscribers on the realtime path, by kind",
+        ),
+        vec!["kind"].as_slice(),
+    )
+    .unwrap();
+    // Per-subscriber wall time from db-writer broadcast send to WS write.
+    // Reuses the bucket set with explicit 30/60/120/300s entries so multi-
+    // minute delivery tails (the failure mode behind the 2026-05-08
+    // incident) land in a visible bucket instead of saturating at +Inf.
+    let event_delivery_latency_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nostr_event_delivery_latency_seconds",
+            "Wall time from broadcast send to per-subscriber WS write",
+        )
+        .buckets(latency_buckets.clone()),
+    )
+    .unwrap();
     let events_rejected = IntCounterVec::new(
         Opts::new(
             "nostr_events_rejected_total",
             "Events rejected before persistence, by reason",
+        ),
+        vec!["reason"].as_slice(),
+    )
+    .unwrap();
+    let subscriptions_rejected = IntCounterVec::new(
+        Opts::new(
+            "nostr_subscriptions_rejected_total",
+            "REQ subscriptions rejected before being registered, by reason",
         ),
         vec!["reason"].as_slice(),
     )
@@ -870,7 +904,10 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(events_received_by_kind.clone())).unwrap();
     registry.register(Box::new(events_persisted_by_kind.clone())).unwrap();
     registry.register(Box::new(events_ephemeral_broadcast_by_kind.clone())).unwrap();
+    registry.register(Box::new(events_delivered_by_kind.clone())).unwrap();
+    registry.register(Box::new(event_delivery_latency_seconds.clone())).unwrap();
     registry.register(Box::new(events_rejected.clone())).unwrap();
+    registry.register(Box::new(subscriptions_rejected.clone())).unwrap();
     registry.register(Box::new(db_events_total.clone())).unwrap();
     registry.register(Box::new(db_events_by_kind.clone())).unwrap();
     registry.register(Box::new(db_authors_distinct.clone())).unwrap();
@@ -896,7 +933,10 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         events_received_by_kind,
         events_persisted_by_kind,
         events_ephemeral_broadcast_by_kind,
+        events_delivered_by_kind,
+        event_delivery_latency_seconds,
         events_rejected,
+        subscriptions_rejected,
         db_events_total,
         db_events_by_kind,
         db_authors_distinct,
@@ -1032,7 +1072,7 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         // other client on this channel.  This should be large enough
         // to accommodate slower readers (messages are dropped if
         // clients can not keep up).
-        let (bcast_tx, _) = broadcast::channel::<Event>(broadcast_buffer_limit);
+        let (bcast_tx, _) = broadcast::channel::<BroadcastEvent>(broadcast_buffer_limit);
         // validated events that need to be persisted are sent to the
         // database on via this channel.
         let (event_tx, event_rx) = mpsc::channel::<SubmittedEvent>(persist_buffer_limit);
@@ -1342,7 +1382,7 @@ async fn nostr_server(
     client_info: ClientInfo,
     settings: Settings,
     mut ws_stream: WebSocketStream<Upgraded>,
-    broadcast: Sender<Event>,
+    broadcast: Sender<BroadcastEvent>,
     event_tx: mpsc::Sender<SubmittedEvent>,
     mut shutdown: Receiver<()>,
     metrics: NostrMetrics,
@@ -1485,7 +1525,7 @@ async fn nostr_server(
                 }
             },
             bcast_result = bcast_rx.recv() => {
-                let global_event = match bcast_result {
+                let bcast_event = match bcast_result {
                     Ok(ev) => ev,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Slow consumer: broadcast channel dropped n events for
@@ -1505,22 +1545,31 @@ async fn nostr_server(
                         break;
                     }
                 };
+                let global_event = &bcast_event.event;
                 let mut should_disconnect = false;
                 // an event has been broadcast to all clients
                 // first check if there is a subscription for this event.
                 for (s, sub) in conn.subscriptions() {
-                    if !sub.interested_in_event(&global_event) {
+                    if !sub.interested_in_event(global_event) {
                         continue;
                     }
                     // TODO: serialize at broadcast time, instead of
                     // once for each consumer.
-                    if let Ok(event_str) = serde_json::to_string(&global_event) {
+                    if let Ok(event_str) = serde_json::to_string(global_event) {
                         if allowed_to_send(&event_str, &conn, &settings) {
                             // create an event response and send it
                             trace!("sub match for client: {}, sub: {:?}, event: {:?}",
                                cid, s,
                                global_event.get_event_id_prefix());
                             let subesc = s.replace('"', "");
+                            let kind_str = global_event.kind.to_string();
+                            // Counted before the WS write so the per-kind delivery
+                            // total matches `sent_events{source="realtime"}` semantics
+                            // (counts attempted writes, not just successful ones).
+                            metrics
+                                .events_delivered_by_kind
+                                .with_label_values(&[&kind_str])
+                                .inc();
                             metrics.sent_events.with_label_values(&["realtime"]).inc();
                             if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]")), ws_write_timeout).await {
                                 debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
@@ -1528,6 +1577,14 @@ async fn nostr_server(
                                 should_disconnect = true;
                                 break;
                             }
+                            // Time from db-writer broadcast send to a per-subscriber
+                            // WS write. Catches the multi-minute delivery tails that
+                            // were invisible in the persist-side metrics during the
+                            // 2026-05-08 incident — observed only on success so the
+                            // histogram does not absorb ws_send failures.
+                            metrics
+                                .event_delivery_latency_seconds
+                                .observe(bcast_event.broadcast_at.elapsed().as_secs_f64());
                         }
                     } else {
                         warn!("could not serialize event: {:?}", global_event.get_event_id_prefix());
@@ -1724,6 +1781,10 @@ async fn nostr_server(
                             }
                             if settings.limits.limit_scrapers && s.is_scraper() {
                                 info!("subscription was scraper, ignoring (cid: {}, sub: {:?})", cid, s.id);
+                                metrics
+                                    .subscriptions_rejected
+                                    .with_label_values(&["scraper"])
+                                    .inc();
                                 if let Err(reason) = ws_send(&mut ws_stream, Message::Text(format!("[\"EOSE\",\"{}\"]", s.id)), ws_write_timeout).await {
                                     debug!("failed to send message (reason: {}), closing connection (cid: {})", reason, cid);
                                     metrics.disconnects.with_label_values(&[reason]).inc();
@@ -1755,6 +1816,20 @@ async fn nostr_server(
                                     }
                                 },
                                 Err(e) => {
+                                    // Distinguish max_subscriptions from id_too_long so the
+                                    // operator can tell "client is leaking subs and never
+                                    // CLOSEing them" (max_subscriptions, hot sustained rate)
+                                    // apart from "buggy client sends garbage IDs"
+                                    // (id_too_long, usually a one-off).
+                                    let reason = match e {
+                                        Error::SubMaxExceededError => "max_subscriptions",
+                                        Error::SubIdMaxLengthError => "id_too_long",
+                                        _ => "other",
+                                    };
+                                    metrics
+                                        .subscriptions_rejected
+                                        .with_label_values(&[reason])
+                                        .inc();
                                     info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid, s.id);
                                     if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&Notice::message(format!("Subscription error: {e}"))), ws_write_timeout).await {
                                         debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
@@ -1896,7 +1971,10 @@ pub struct NostrMetrics {
     pub events_received_by_kind: IntCounterVec, // valid events received from clients, by kind
     pub events_persisted_by_kind: IntCounterVec, // events successfully persisted, by kind
     pub events_ephemeral_broadcast_by_kind: IntCounterVec, // ephemeral events broadcast, by kind
+    pub events_delivered_by_kind: IntCounterVec, // events queued for realtime delivery, by kind
+    pub event_delivery_latency_seconds: Histogram, // broadcast-send to per-subscriber WS write
     pub events_rejected: IntCounterVec, // events rejected before persistence, by reason
+    pub subscriptions_rejected: IntCounterVec, // REQ subscriptions rejected before registration
     pub db_events_total: IntGauge,   // estimated total events in DB
     pub db_events_by_kind: IntGaugeVec, // event count per kind in DB
     pub db_authors_distinct: IntGauge, // distinct authors in DB (estimate)

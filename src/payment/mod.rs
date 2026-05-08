@@ -1,5 +1,5 @@
+use crate::db::BroadcastEvent;
 use crate::error::{Error, Result};
-use crate::event::Event;
 use crate::payment::cln_rest::ClnRestPaymentProcessor;
 use crate::payment::lnbits::LNBitsPaymentProcessor;
 use crate::repo::NostrRepo;
@@ -19,7 +19,7 @@ pub struct Payment {
     /// Repository for saving/retrieving events and events
     repo: Arc<dyn NostrRepo>,
     /// Newly validated events get written and then broadcast on this channel to subscribers
-    event_tx: tokio::sync::broadcast::Sender<Event>,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
     /// Payment message sender
     payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
     /// Payment message receiver
@@ -99,7 +99,7 @@ impl Payment {
         repo: Arc<dyn NostrRepo>,
         payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
         payment_rx: tokio::sync::broadcast::Receiver<PaymentMessage>,
-        event_tx: tokio::sync::broadcast::Sender<Event>,
+        event_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
         settings: crate::config::Settings,
     ) -> Result<Self> {
         info!("Create payment handler");
@@ -229,8 +229,12 @@ impl Payment {
         self.repo.write_event(&invoice_event.clone().into()).await?;
 
         // Broadcast DM events
-        self.event_tx.send(message_event.clone().into()).ok();
-        self.event_tx.send(invoice_event.clone().into()).ok();
+        self.event_tx
+            .send(BroadcastEvent::new(message_event.clone().into()))
+            .ok();
+        self.event_tx
+            .send(BroadcastEvent::new(invoice_event.clone().into()))
+            .ok();
 
         Ok(())
     }
