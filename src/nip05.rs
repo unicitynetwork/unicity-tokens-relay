@@ -5,6 +5,7 @@
 //! consumes a stream of metadata events, and keeps a database table
 //! updated with the current NIP-05 verification status.
 use crate::config::VerifiedUsers;
+use crate::db::BroadcastEvent;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::repo::NostrRepo;
@@ -26,7 +27,7 @@ pub struct Verifier {
     /// Metadata events for us to inspect
     metadata_rx: tokio::sync::broadcast::Receiver<Event>,
     /// Newly validated events get written and then broadcast on this channel to subscribers
-    event_tx: tokio::sync::broadcast::Sender<Event>,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
     /// Settings
     settings: crate::config::Settings,
     /// HTTP client
@@ -128,7 +129,7 @@ impl Verifier {
     pub fn new(
         repo: Arc<dyn NostrRepo>,
         metadata_rx: tokio::sync::broadcast::Receiver<Event>,
-        event_tx: tokio::sync::broadcast::Sender<Event>,
+        event_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
         settings: crate::config::Settings,
     ) -> Result<Self> {
         info!("creating NIP-05 verifier");
@@ -475,7 +476,9 @@ impl Verifier {
                             event.get_event_id_prefix(),
                             start.elapsed()
                         );
-                        self.event_tx.send(event.clone()).ok();
+                        self.event_tx
+                            .send(BroadcastEvent::new(event.clone()))
+                            .ok();
                     }
                 }
                 Err(err) => {

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use futures::SinkExt;
 use futures::StreamExt;
+use hyper::body::to_bytes;
+use hyper::{Client, StatusCode, Uri};
 use std::thread;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -44,6 +46,67 @@ async fn relay_home_page() -> Result<()> {
     let relay = common::start_relay()?;
     common::wait_for_healthy_relay(&relay).await?;
     // tell relay to shutdown
+    let _res = relay.shutdown_tx.send(());
+    Ok(())
+}
+
+/// Smoke-test the delivery-side metrics introduced for issue #23. Catches
+/// the typical wiring mistakes: forgetting `registry.register(...)`,
+/// dropping a field from the `NostrMetrics` struct, or renaming a metric.
+///
+/// Two classes of metric, two assertion strategies:
+///   - Histogram / standalone Counter / Gauge: always emit even with zero
+///     samples, so plain string presence is enough.
+///   - `IntCounterVec`: prometheus only emits a series once a label has
+///     been touched. We trigger the `max_subscriptions` rejection path
+///     by saturating per-connection sub limits, then assert the resulting
+///     series appears.
+#[tokio::test]
+async fn delivery_metrics_are_registered() -> Result<()> {
+    let relay = common::start_relay()?;
+    common::wait_for_healthy_relay(&relay).await?;
+    let port = relay.port;
+
+    // Drive `nostr_subscriptions_rejected_total{reason="max_subscriptions"}`
+    // off zero so prometheus emits the series. ClientConn::max_subs is 32,
+    // so the 33rd REQ on a connection trips SubMaxExceededError.
+    let (mut ws, _res) = connect_async(format!("ws://127.0.0.1:{port}")).await?;
+    for i in 0..33 {
+        let req = format!("[\"REQ\",\"sub-{i}\",{{\"kinds\":[1]}}]");
+        ws.send(req.into()).await?;
+    }
+    // Drain a few NOTICE / EOSE responses so the relay finishes processing
+    // before we scrape; bounded so a stuck server can't hang the test.
+    for _ in 0..40 {
+        if tokio::time::timeout(Duration::from_millis(200), ws.next())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let uri: Uri = format!("http://127.0.0.1:{port}/metrics").parse()?;
+    let client = Client::new();
+    let res = client.get(uri).await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = to_bytes(res.into_body()).await?;
+    let body = std::str::from_utf8(&body_bytes)?;
+
+    for needle in [
+        "nostr_event_delivery_latency_seconds",
+        "nostr_broadcast_lagged_total",
+        "nostr_subscriptions_active",
+        // Series only exists once a label is incremented (above).
+        "nostr_subscriptions_rejected_total{reason=\"max_subscriptions\"}",
+    ] {
+        assert!(
+            body.contains(needle),
+            "expected /metrics to expose {needle}; got body:\n{body}"
+        );
+    }
+
+    ws.close(None).await.ok();
     let _res = relay.shutdown_tx.send(());
     Ok(())
 }

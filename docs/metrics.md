@@ -21,6 +21,7 @@ These are updated synchronously as traffic hits the relay.
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `nostr_subscriptions_active` | gauge | — | Currently-active REQ subscriptions across all clients |
+| `nostr_subscriptions_rejected_total` | counter | `reason` | REQ subscriptions rejected before registration. Reasons: `max_subscriptions` (per-connection cap of 32 hit — usually a client creating subs without CLOSEing them; this was the pattern behind the 2026-05-08 incident), `id_too_long` (sub id > 256 bytes), `scraper` (matched `is_scraper()` with `limits.limit_scrapers` enabled), `other`. |
 | `nostr_query_abort_total` | counter | `reason` | Server-side query aborts |
 
 ### Protocol commands
@@ -41,19 +42,21 @@ Counters for raw command frames received from clients.
 | `nostr_events_received_by_kind_total` | counter | `kind` | Successfully parsed events received from clients, by kind. The accounting identity `received = persisted + ephemeral_broadcast + rejected` holds across all kinds (see the three counters below). |
 | `nostr_events_persisted_by_kind_total` | counter | `kind` | Events successfully written to the database, by kind. Ephemeral events (kinds in `[20000, 30000)`) are *not* counted here — see the next row. |
 | `nostr_events_ephemeral_broadcast_by_kind_total` | counter | `kind` | Ephemeral events broadcast to subscribers without being persisted, by kind. |
+| `nostr_events_delivered_total` | counter | `kind` | Events queued for delivery to a subscriber on the realtime path, by kind. One increment per matching subscription per connection (so this is a fan-out count, not unique events). Pair with `nostr_events_persisted_by_kind_total` to see realtime delivery fan-out — a sustained drop in the ratio means broadcasts aren't reaching open subs. |
 | `nostr_events_rejected_total` | counter | `reason` | Events rejected before persistence. Reasons: `expired`, `future_dated`, `kind_blacklist`, `kind_allowlist`, `pubkey_not_whitelisted`, `not_admitted`, `insufficient_balance`, `pubkey_not_registered`, `admission_check_error`, `nip05_invalid`, `nip05_missing`, `nip05_error`, `grpc_denied`, `duplicate`, `write_error` |
 | `nostr_events_sent_total` | counter | `source` | Events sent to subscribers. `source` = `db` (historical query result) or `realtime` (broadcast match) |
 | `nostr_broadcast_lagged_total` | counter | — | Broadcast events dropped because a per-connection receiver fell behind (the receiver's slot in the broadcast channel overflowed `broadcast_buffer`). Spikes here indicate slow consumers — usually backpressure from a stuck `ws_stream.send`. |
 
 ### Latency histograms
 
-Default Prometheus buckets (`5ms` … `10s`).
+All histograms use explicit buckets reaching to 300s — Prometheus' default top bucket of 10s silently caps p99 at ~10s, which hid the 60–150s `sqlx` query latencies during the Apr 30 incident. The bucket set is `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300]`.
 
 | Metric | Type | Description |
 |---|---|---|
 | `nostr_query_seconds` | histogram | End-to-end subscription response time |
 | `nostr_filter_seconds` | histogram | Single SQL filter execution time |
 | `nostr_events_write_seconds` | histogram | Event-write latency |
+| `nostr_event_delivery_latency_seconds` | histogram | Wall time from db_writer broadcast send to per-subscriber WS write. Catches multi-minute live-delivery tails (the 2026-05-08 failure mode) that are invisible in persist-side latency. Observed once per successful WS write, so failed writes don't pollute the distribution. |
 
 ## State metrics (background-collected)
 
