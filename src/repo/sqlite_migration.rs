@@ -871,13 +871,13 @@ PRIMARY KEY (namespace, d_tag)
 );
 
 INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen)
-SELECT 'unicity:nametag', dt.value, e.author, MIN(e.first_seen)
+SELECT 'unicity:nametag', COALESCE(lower(hex(dt.value_hex)), dt.value), e.author, MIN(e.first_seen)
 FROM event e
 JOIN tag dt ON dt.event_id = e.id AND dt.name = 'd'
 WHERE e.kind = 30078
   AND e.content LIKE '%nametag_hash%'
-  AND dt.value IS NOT NULL
-GROUP BY dt.value;
+  AND (dt.value IS NOT NULL OR dt.value_hex IS NOT NULL)
+GROUP BY COALESCE(lower(hex(dt.value_hex)), dt.value);
 
 pragma optimize;
 PRAGMA user_version = 19;

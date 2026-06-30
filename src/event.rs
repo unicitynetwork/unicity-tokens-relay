@@ -338,8 +338,11 @@ impl Event {
         if let Some(allowable_past) = reject_past_seconds {
             // reject events whose timestamp is implausibly far in the past;
             // complements the future bound (UNIP-01 defense in depth so a
-            // self-asserted created_at cannot be set to an arbitrary past value)
-            if self.created_at + (allowable_past as u64) < curr_time {
+            // self-asserted created_at cannot be set to an arbitrary past value).
+            // Subtract rather than add so a near-u64::MAX created_at cannot
+            // overflow; a future timestamp (created_at >= curr_time) is never
+            // "too far past" and is handled by the future bound above.
+            if self.created_at < curr_time && curr_time - self.created_at > allowable_past as u64 {
                 let delta = curr_time - self.created_at;
                 debug!(
                     "event is too far in the past ({} seconds), rejecting",
@@ -922,5 +925,16 @@ mod tests {
         let mut event = Event::simple_event();
         event.created_at = crate::utils::unix_time();
         assert!(event.is_valid_timestamp(Some(1800), Some(86400)));
+    }
+
+    #[test]
+    fn timestamp_past_bound_no_overflow_on_max_created_at() {
+        let mut event = Event::simple_event();
+        event.created_at = u64::MAX;
+        // Past bound only: must not overflow/panic. A far-future timestamp is
+        // not "too far past", so the past bound does not reject it.
+        assert!(event.is_valid_timestamp(None, Some(86400)));
+        // With a future bound configured, the far-future timestamp is rejected.
+        assert!(!event.is_valid_timestamp(Some(1800), Some(86400)));
     }
 }
