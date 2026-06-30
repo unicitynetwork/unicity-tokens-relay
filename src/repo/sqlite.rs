@@ -51,6 +51,9 @@ pub struct SqliteRepo {
     write_in_progress: Arc<Mutex<u64>>,
     /// Semaphore for readers to acquire blocking threads
     reader_threads_ready: Arc<Semaphore>,
+    /// UNIP-01 single-owner namespaces (NIP-32 label values enforced as
+    /// single-owner identity bindings). Empty disables enforcement.
+    uniqueness_namespaces: Vec<String>,
 }
 
 impl SqliteRepo {
@@ -99,6 +102,11 @@ impl SqliteRepo {
             checkpoint_in_progress,
             write_in_progress,
             reader_threads_ready,
+            uniqueness_namespaces: settings
+                .authorization
+                .uniqueness_namespaces
+                .clone()
+                .unwrap_or_default(),
         }
     }
 
@@ -129,7 +137,11 @@ impl SqliteRepo {
     }
 
     /// Persist an event to the database, returning rows added.
-    pub fn persist_event(conn: &mut PooledConnection, e: &Event) -> Result<u64> {
+    pub fn persist_event(
+        conn: &mut PooledConnection,
+        e: &Event,
+        uniqueness_namespaces: &[String],
+    ) -> Result<u64> {
         // enable auto vacuum
         conn.execute_batch("pragma auto_vacuum = FULL")?;
 
@@ -141,6 +153,31 @@ impl SqliteRepo {
         let delegator_blob: Option<Vec<u8>> =
             e.delegated_by.as_ref().and_then(|d| hex::decode(d).ok());
         let event_str = serde_json::to_string(&e).ok();
+        // UNIP-01: single-owner enforcement. If this event claims a configured
+        // single-owner namespace (NIP-32 ["L", ns] + d-tag), the first author
+        // the relay records owns the (namespace, d-tag); a later event from a
+        // different author is rejected. Ownership is by relay receive time
+        // (first_seen), never the event's self-asserted created_at. The
+        // INSERT-OR-IGNORE + re-SELECT runs in this transaction so concurrent
+        // first-claims serialize on the primary key.
+        if let Some((namespace, d_tag)) = e.uniqueness_claim(uniqueness_namespaces) {
+            tx.execute(
+                "INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES (?1, ?2, ?3, strftime('%s','now'));",
+                params![namespace, d_tag, pubkey_blob],
+            )?;
+            let owner: Vec<u8> = tx.query_row(
+                "SELECT author FROM namespace_owner WHERE namespace=?1 AND d_tag=?2;",
+                params![namespace, d_tag],
+                |row| row.get(0),
+            )?;
+            if Some(&owner) != pubkey_blob.as_ref() {
+                // Dropping `tx` here rolls back (incl. the no-op INSERT OR
+                // IGNORE above), leaving the existing owner record intact.
+                return Err(crate::error::Error::EventBlocked(
+                    "nametag is owned by another key".to_owned(),
+                ));
+            }
+        }
         // check for replaceable events that would hide this one; we won't even attempt to insert these.
         if e.is_replaceable() {
             let repl_count = tx.query_row(
@@ -313,13 +350,14 @@ impl NostrRepo for SqliteRepo {
         //let mut conn = self.write_pool.get()?;
         let pool = self.write_pool.clone();
         let e = e.clone();
+        let uniqueness_namespaces = self.uniqueness_namespaces.clone();
         let event_count = task::spawn_blocking(move || {
             let mut conn = pool.get()?;
             // this could fail because the database was busy; try
             // multiple times before giving up.
             loop {
                 attempts += 1;
-                let wr = SqliteRepo::persist_event(&mut conn, &e);
+                let wr = SqliteRepo::persist_event(&mut conn, &e, &uniqueness_namespaces);
                 match wr {
                     Err(SqlError(rusqlite::Error::SqliteFailure(e, _))) => {
                         // this basically means that NIP-05 or another
@@ -1818,5 +1856,102 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(remaining, vec![3]);
+    }
+
+    /// UNIP-01: a single-owner namespace binding (NIP-32 ["L","unicity:nametag"]
+    /// + d-tag) is owned by the first author the relay accepts; a later binding
+    /// for the same identifier from a different author is rejected, while the
+    /// owner can keep updating its own binding.
+    #[test]
+    fn unip01_persist_event_enforces_single_owner() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+
+        let mk = |id: &str, author: &str, created_at: u64| Event {
+            id: id.to_owned(),
+            pubkey: author.to_owned(),
+            delegated_by: None,
+            created_at,
+            kind: 30078,
+            tags: vec![
+                vec!["d".to_owned(), "nm1".to_owned()],
+                vec!["L".to_owned(), "unicity:nametag".to_owned()],
+            ],
+            content: "{\"nametag_hash\":\"x\"}".to_owned(),
+            sig: "00".to_owned(),
+            tagidx: None,
+        };
+
+        // First author claims the identifier.
+        let a1 = mk(&"11".repeat(32), &author_a, 1_700_000_000);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &a1, &ns).unwrap(),
+            1,
+            "first author should be accepted"
+        );
+
+        // A different author claiming the same identifier is rejected.
+        let b1 = mk(&"22".repeat(32), &author_b, 1_700_000_000);
+        assert!(
+            matches!(
+                SqliteRepo::persist_event(&mut conn, &b1, &ns),
+                Err(crate::error::Error::EventBlocked(_))
+            ),
+            "a different author must be blocked"
+        );
+
+        // The original owner can still update its own binding.
+        let a2 = mk(&"33".repeat(32), &author_a, 1_700_000_001);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &a2, &ns).unwrap(),
+            1,
+            "owner should be able to update"
+        );
+
+        // Ownership is recorded as the first author, by relay receive order.
+        let owner: Vec<u8> = conn
+            .query_row(
+                "SELECT author FROM namespace_owner WHERE namespace='unicity:nametag' AND d_tag='nm1';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, hex::decode(&author_a).unwrap());
+    }
+
+    /// Without the namespace marker, the same identifier from two authors is
+    /// NOT subject to single-owner enforcement (ordinary NIP-33 per-author
+    /// semantics) — enforcement is opt-in via the ["L", ...] label.
+    #[test]
+    fn unip01_no_marker_is_not_enforced() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let mk = |id: &str, author: &str| Event {
+            id: id.to_owned(),
+            pubkey: author.to_owned(),
+            delegated_by: None,
+            created_at: 1_700_000_000,
+            kind: 30078,
+            tags: vec![vec!["d".to_owned(), "nm2".to_owned()]], // no ["L", ...]
+            content: "{\"nametag_hash\":\"x\"}".to_owned(),
+            sig: "00".to_owned(),
+            tagidx: None,
+        };
+
+        let a = mk(&"44".repeat(32), &"aa".repeat(32));
+        let b = mk(&"55".repeat(32), &"bb".repeat(32));
+        assert_eq!(SqliteRepo::persist_event(&mut conn, &a, &ns).unwrap(), 1);
+        // unmarked binding from a different author is stored (not blocked)
+        assert_eq!(SqliteRepo::persist_event(&mut conn, &b, &ns).unwrap(), 1);
     }
 }

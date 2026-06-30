@@ -109,6 +109,13 @@ port = 8080
 # the future.  Recommended to reject anything greater than 30 minutes
 # from the current time, but the default is to allow any date.
 reject_future_seconds = 1800
+# Reject events that have timestamps more than this many seconds in the
+# PAST.  Complements reject_future_seconds.  Recommended as defense in
+# depth for identity bindings (UNIP-01) so a self-asserted created_at
+# cannot be set to an arbitrary past value.  Default is to allow any
+# past date.  Set generously (e.g. one day) to tolerate legitimate
+# client clock skew and delayed republishes.
+#reject_past_seconds = 86400
 
 [limits]
 # Limit events created per second, averaged over one minute.  Must be
@@ -187,6 +194,14 @@ limit_scrapers = false
 #nip42_auth = false
 # Send DMs (kind 4 and 44) and gift wraps (kind 1059) only to their authenticated recipients
 #nip42_dms = false
+# UNIP-01 single-owner namespaces.  An identity binding carrying a NIP-32
+# ["L", <namespace>] label whose value is in this list is enforced as
+# single-owner: the first author the relay records for a given identifier
+# (d-tag) owns it, ordered by relay receive time; later bindings for the
+# same identifier from a different key are rejected with `blocked:`.
+# Defaults to ["unicity:nametag"].  Set to [] to disable enforcement.
+# See docs/UNIP-01.md.
+#uniqueness_namespaces = ["unicity:nametag"]
 
 [verified_users]
 # NIP-05 verification of users.  Can be "enabled" to require NIP-05
