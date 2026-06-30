@@ -84,6 +84,11 @@ pub enum Error {
     HTTPError(http::Error),
     #[error("Unknown/Undocumented")]
     UnknownError,
+    // UNIP-01: the event claims a single-owner namespaced identifier that is
+    // already owned by a different key. Surfaced to the client as a NIP-20
+    // `blocked:` result.
+    #[error("Event blocked: {0}")]
+    EventBlocked(String),
 }
 
 //impl From<Box<dyn std::error::Error>> for Error {

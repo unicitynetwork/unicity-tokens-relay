@@ -1680,8 +1680,11 @@ async fn nostr_server(
                                         metrics.disconnects.with_label_values(&[reason]).inc();
                                         break;
                                     }
-                                    // check if the event is too far in the future.
-                                } else if e.is_valid_timestamp(settings.options.reject_future_seconds) {
+                                    // check if the event created_at is within the acceptable range.
+                                } else if e.is_valid_timestamp(
+                                    settings.options.reject_future_seconds,
+                                    settings.options.reject_past_seconds,
+                                ) {
                                     // Write this to the database.
                                     let auth_pubkey = conn.auth_pubkey().and_then(|pubkey| hex::decode(pubkey).ok());
                                     let submit_event = SubmittedEvent {
@@ -1694,17 +1697,21 @@ async fn nostr_server(
                                     event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
                                 } else {
-                                    metrics.events_rejected.with_label_values(&["future_dated"]).inc();
-                                    info!("client: {} sent a far future-dated event", cid);
-                                    if let Some(fut_sec) = settings.options.reject_future_seconds {
-                                        let msg = format!("The event created_at field is out of the acceptable range (+{fut_sec}sec) for this relay.");
-                                        let notice = Notice::invalid(e.id, &msg);
-                                        if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice), ws_write_timeout).await {
-                                            debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
-                                            metrics.disconnects.with_label_values(&[reason]).inc();
-                                            break;
-
-                                        }
+                                    metrics.events_rejected.with_label_values(&["out_of_range_created_at"]).inc();
+                                    info!("client: {} sent an out-of-range created_at event", cid);
+                                    let fut = settings.options.reject_future_seconds;
+                                    let past = settings.options.reject_past_seconds;
+                                    let msg = match (fut, past) {
+                                        (Some(f), Some(p)) => format!("The event created_at field is out of the acceptable range (-{p}sec to +{f}sec) for this relay."),
+                                        (Some(f), None) => format!("The event created_at field is out of the acceptable range (+{f}sec) for this relay."),
+                                        (None, Some(p)) => format!("The event created_at field is out of the acceptable range (-{p}sec) for this relay."),
+                                        (None, None) => "The event created_at field is out of the acceptable range for this relay.".to_string(),
+                                    };
+                                    let notice = Notice::invalid(e.id, &msg);
+                                    if let Err(reason) = ws_send(&mut ws_stream, make_notice_message(&notice), ws_write_timeout).await {
+                                        debug!("failed to send notice (reason: {}), closing connection (cid: {})", reason, cid);
+                                        metrics.disconnects.with_label_values(&[reason]).inc();
+                                        break;
                                     }
                                 }
                             },

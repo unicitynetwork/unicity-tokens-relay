@@ -35,6 +35,9 @@ pub struct PostgresRepo {
     /// — pool metrics must read from one of them only, otherwise the
     /// in-use count would double-count the shared pool.
     separate_write_pool: bool,
+    /// UNIP-01 single-owner namespaces (NIP-32 label values enforced as
+    /// single-owner identity bindings). Empty disables enforcement.
+    uniqueness_namespaces: Vec<String>,
 }
 
 impl PostgresRepo {
@@ -43,12 +46,14 @@ impl PostgresRepo {
         cw: PostgresPool,
         m: NostrMetrics,
         separate_write_pool: bool,
+        uniqueness_namespaces: Vec<String>,
     ) -> PostgresRepo {
         PostgresRepo {
             conn: c,
             conn_write: cw,
             metrics: m,
             separate_write_pool,
+            uniqueness_namespaces,
         }
     }
 
@@ -136,6 +141,36 @@ impl NostrRepo for PostgresRepo {
         let delegator_blob: Option<Vec<u8>> =
             e.delegated_by.as_ref().and_then(|d| hex::decode(d).ok());
         let event_str = serde_json::to_string(&e).unwrap();
+
+        // UNIP-01: single-owner enforcement. If this event claims a configured
+        // single-owner namespace (NIP-32 ["L", ns] + d-tag), the first author
+        // the relay records owns the (namespace, d-tag); a later event from a
+        // different author is rejected. Ownership is by relay receive time
+        // (namespace_owner.first_seen DEFAULT now()), never the event's
+        // self-asserted created_at. The upsert + re-select run in this
+        // transaction so concurrent first-claims serialize on the primary key.
+        if let Some((namespace, d_tag)) = e.uniqueness_claim(&self.uniqueness_namespaces) {
+            sqlx::query(
+                "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ($1, $2, $3) ON CONFLICT (namespace, d_tag) DO NOTHING;")
+                .bind(&namespace)
+                .bind(&d_tag)
+                .bind(&pubkey_blob)
+                .execute(&mut tx)
+                .await?;
+            let owner: Vec<u8> = sqlx::query_scalar(
+                "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag=$2;")
+                .bind(&namespace)
+                .bind(&d_tag)
+                .fetch_one(&mut tx)
+                .await?;
+            if Some(&owner) != pubkey_blob.as_ref() {
+                // Returning here drops `tx`, rolling back the no-op upsert and
+                // leaving the existing owner record intact.
+                return Err(error::Error::EventBlocked(
+                    "nametag is owned by another key".to_owned(),
+                ));
+            }
+        }
 
         // determine if this event would be shadowed by an existing
         // replaceable event or parameterized replaceable event.

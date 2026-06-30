@@ -135,7 +135,17 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
     };
     metrics.db_pool_size.set(db_pool_size);
 
-    let repo = PostgresRepo::new(pool, write_pool, metrics, separate_write_pool);
+    let repo = PostgresRepo::new(
+        pool,
+        write_pool,
+        metrics,
+        separate_write_pool,
+        settings
+            .authorization
+            .uniqueness_namespaces
+            .clone()
+            .unwrap_or_default(),
+    );
 
     // Panic on migration failure
     let version = repo.migrate_up().await.unwrap();
@@ -550,6 +560,22 @@ pub async fn db_writer(ctx: DbWriterContext) -> Result<()> {
                         bcast_tx.send(BroadcastEvent::new(event.clone())).ok();
                         notice_tx.try_send(Notice::saved(event.id)).ok();
                     }
+                }
+                // UNIP-01: the event claims a single-owner identifier already
+                // held by a different key — reject with a NIP-20 `blocked:`.
+                Err(Error::EventBlocked(reason)) => {
+                    debug!(
+                        "blocked event: {:?} (kind: {}) from: {:?} — {}",
+                        event.get_event_id_prefix(),
+                        event.kind,
+                        event.get_author_prefix(),
+                        reason,
+                    );
+                    notice_tx.try_send(Notice::blocked(event.id, &reason)).ok();
+                    metrics
+                        .events_rejected
+                        .with_label_values(&["blocked_uniqueness"])
+                        .inc();
                 }
                 Err(err) => {
                     warn!("event insert failed: {:?}", err);

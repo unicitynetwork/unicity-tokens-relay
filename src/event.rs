@@ -318,9 +318,13 @@ impl Event {
     }
 
     #[must_use]
-    pub fn is_valid_timestamp(&self, reject_future_seconds: Option<usize>) -> bool {
+    pub fn is_valid_timestamp(
+        &self,
+        reject_future_seconds: Option<usize>,
+        reject_past_seconds: Option<usize>,
+    ) -> bool {
+        let curr_time = unix_time();
         if let Some(allowable_future) = reject_future_seconds {
-            let curr_time = unix_time();
             // calculate difference, plus how far future we allow
             if curr_time + (allowable_future as u64) < self.created_at {
                 let delta = self.created_at - curr_time;
@@ -331,7 +335,36 @@ impl Event {
                 return false;
             }
         }
+        if let Some(allowable_past) = reject_past_seconds {
+            // reject events whose timestamp is implausibly far in the past;
+            // complements the future bound (UNIP-01 defense in depth so a
+            // self-asserted created_at cannot be set to an arbitrary past value)
+            if self.created_at + (allowable_past as u64) < curr_time {
+                let delta = curr_time - self.created_at;
+                debug!(
+                    "event is too far in the past ({} seconds), rejecting",
+                    delta
+                );
+                return false;
+            }
+        }
         true
+    }
+
+    /// UNIP-01: if this event opts into one of the configured single-owner
+    /// namespaces, return `(namespace, d_tag)`. The event must carry a NIP-32
+    /// `["L", <namespace>]` label whose value is one of `namespaces`, together
+    /// with a parameterized-replaceable `d` tag. Returns `None` otherwise.
+    #[must_use]
+    pub fn uniqueness_claim(&self, namespaces: &[String]) -> Option<(String, String)> {
+        if namespaces.is_empty() {
+            return None;
+        }
+        let d_tag = self.distinct_param()?;
+        self.tag_values_by_name("L")
+            .into_iter()
+            .find(|label| namespaces.iter().any(|ns| ns == label))
+            .map(|ns| (ns, d_tag))
     }
 
     /// Check if this event has a valid signature.
@@ -794,5 +827,100 @@ mod tests {
             vec!["expiration".to_string(), (20).to_string()],
         ];
         assert_eq!(event.expiration(), Some(10));
+    }
+
+    // ---- UNIP-01: uniqueness_claim ----
+
+    #[test]
+    fn uniqueness_claim_matches_marker() {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = vec![
+            vec!["d".to_owned(), "abc".to_owned()],
+            vec!["L".to_owned(), "unicity:nametag".to_owned()],
+        ];
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(
+            event.uniqueness_claim(&ns),
+            Some(("unicity:nametag".to_owned(), "abc".to_owned()))
+        );
+    }
+
+    #[test]
+    fn uniqueness_claim_requires_marker() {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = vec![vec!["d".to_owned(), "abc".to_owned()]];
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.uniqueness_claim(&ns), None);
+    }
+
+    #[test]
+    fn uniqueness_claim_ignores_unconfigured_namespace() {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = vec![
+            vec!["d".to_owned(), "abc".to_owned()],
+            vec!["L".to_owned(), "other:ns".to_owned()],
+        ];
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.uniqueness_claim(&ns), None);
+    }
+
+    #[test]
+    fn uniqueness_claim_requires_param_replaceable_kind() {
+        // kind 1 is not parameterized-replaceable, so there is no d-tag claim
+        let mut event = Event::simple_event();
+        event.kind = 1;
+        event.tags = vec![
+            vec!["d".to_owned(), "abc".to_owned()],
+            vec!["L".to_owned(), "unicity:nametag".to_owned()],
+        ];
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.uniqueness_claim(&ns), None);
+    }
+
+    #[test]
+    fn uniqueness_claim_empty_config_disables() {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = vec![
+            vec!["d".to_owned(), "abc".to_owned()],
+            vec!["L".to_owned(), "unicity:nametag".to_owned()],
+        ];
+        assert_eq!(event.uniqueness_claim(&[]), None);
+    }
+
+    // ---- UNIP-01: is_valid_timestamp past/future bounds ----
+
+    #[test]
+    fn timestamp_past_bound_rejects_backdated() {
+        let mut event = Event::simple_event();
+        event.created_at = 1000; // far in the past
+        // future bound only -> accepted
+        assert!(event.is_valid_timestamp(Some(1800), None));
+        // past bound active -> rejected
+        assert!(!event.is_valid_timestamp(Some(1800), Some(86400)));
+    }
+
+    #[test]
+    fn timestamp_future_bound_rejects_postdated() {
+        let mut event = Event::simple_event();
+        event.created_at = 9_999_999_999; // year 2286
+        assert!(!event.is_valid_timestamp(Some(1800), None));
+    }
+
+    #[test]
+    fn timestamp_no_bounds_accepts_any() {
+        let mut event = Event::simple_event();
+        event.created_at = 0;
+        assert!(event.is_valid_timestamp(None, None));
+    }
+
+    #[test]
+    fn timestamp_recent_accepted_within_bounds() {
+        let mut event = Event::simple_event();
+        event.created_at = crate::utils::unix_time();
+        assert!(event.is_valid_timestamp(Some(1800), Some(86400)));
     }
 }

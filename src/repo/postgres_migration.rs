@@ -39,6 +39,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     run_migration(m005::migration(), db).await;
     m006::run(db).await?;
     m007::run(db).await?;
+    run_migration(m008::migration(), db).await;
     Ok(current_version(db).await as usize)
 }
 
@@ -576,5 +577,48 @@ mod m007 {
 
         info!("m007: complete");
         Ok(())
+    }
+}
+
+mod m008 {
+    use crate::repo::postgres_migration::{Migration, SimpleSqlMigration};
+
+    pub const VERSION: i64 = 8;
+
+    pub fn migration() -> impl Migration {
+        SimpleSqlMigration {
+            serial_number: VERSION,
+            sql: vec![
+                // UNIP-01 single-owner identity bindings (see docs/UNIP-01.md).
+                r#"
+CREATE TABLE IF NOT EXISTS namespace_owner (
+	namespace text NOT NULL,
+	d_tag text NOT NULL,
+	author bytea NOT NULL,
+	first_seen timestamp with time zone NOT NULL DEFAULT now(),
+	CONSTRAINT namespace_owner_pkey PRIMARY KEY (namespace, d_tag)
+);
+                "#,
+                // Backfill existing Unicity nametag bindings: assign each d-tag
+                // to the author the relay saw FIRST (by first_seen), i.e. relay
+                // receive time — never the events' self-asserted created_at.
+                // Legacy bindings are identified by their content marker
+                // ("nametag_hash"); d_tag is reconstructed to the same
+                // lowercase-hex string that distinct_param() produces at runtime.
+                r#"
+INSERT INTO namespace_owner (namespace, d_tag, author, first_seen)
+SELECT 'unicity:nametag',
+       COALESCE(encode(dt.value_hex, 'hex'), convert_from(dt.value, 'UTF8')),
+       (ARRAY_AGG(e.pub_key ORDER BY e.first_seen ASC))[1],
+       MIN(e.first_seen)
+FROM event e
+JOIN tag dt ON dt.event_id = e.id AND dt.name = 'd'
+WHERE e.kind = 30078
+  AND position('nametag_hash' in convert_from(e.content, 'UTF8')) > 0
+GROUP BY 1, 2
+ON CONFLICT (namespace, d_tag) DO NOTHING;
+                "#,
+            ],
+        }
     }
 }

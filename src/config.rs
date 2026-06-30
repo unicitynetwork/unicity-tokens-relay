@@ -53,6 +53,7 @@ pub struct Network {
 #[allow(unused)]
 pub struct Options {
     pub reject_future_seconds: Option<usize>, // if defined, reject any events with a timestamp more than X seconds in the future
+    pub reject_past_seconds: Option<usize>, // if defined, reject any events with a timestamp more than X seconds in the past (UNIP-01 defense in depth)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +90,10 @@ pub struct Authorization {
     pub pubkey_whitelist: Option<Vec<String>>, // If present, only allow these pubkeys to publish events
     pub nip42_auth: bool,                      // if true enables NIP-42 authentication
     pub nip42_dms: bool, // if true send DMs only to their authenticated recipients
+    // UNIP-01: NIP-32 label namespaces enforced as single-owner. An identity
+    // binding carrying ["L", <namespace>] in this list claims its d-tag; the
+    // first author to claim a (namespace, d-tag) owns it. See docs/UNIP-01.md.
+    pub uniqueness_namespaces: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +361,9 @@ impl Default for Settings {
                 pubkey_whitelist: None, // Allow any address to publish
                 nip42_auth: false,      // Disable NIP-42 authentication
                 nip42_dms: false,       // Send DMs to everybody
+                // Enforce single-owner identity bindings for the Unicity
+                // nametag namespace by default (UNIP-01).
+                uniqueness_namespaces: Some(vec!["unicity:nametag".to_owned()]),
             },
             pay_to_relay: PayToRelay {
                 enabled: false,
@@ -388,6 +396,7 @@ impl Default for Settings {
             },
             options: Options {
                 reject_future_seconds: None, // Reject events in the future if defined
+                reject_past_seconds: None,   // Reject events in the past if defined
             },
             logging: Logging {
                 folder_path: None,

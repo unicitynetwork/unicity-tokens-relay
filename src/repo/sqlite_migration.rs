@@ -23,7 +23,7 @@ pragma mmap_size = 0; -- disable mmap (default)
 "##;
 
 /// Latest database version
-pub const DB_VERSION: usize = 18;
+pub const DB_VERSION: usize = 19;
 
 /// Schema definition
 const INIT_SQL: &str = formatcp!(
@@ -123,6 +123,16 @@ CONSTRAINT invoice_pubkey_fkey FOREIGN KEY (pubkey) REFERENCES account (pubkey) 
 
 -- Create invoice index
 CREATE INDEX IF NOT EXISTS invoice_pubkey_index ON invoice(pubkey);
+
+-- UNIP-01 single-owner identity bindings (see docs/UNIP-01.md).
+-- Records the owning author of each (namespace, d-tag), by relay receive time.
+CREATE TABLE IF NOT EXISTS namespace_owner (
+namespace TEXT NOT NULL, -- UNIP-01 namespace, e.g. "unicity:nametag"
+d_tag TEXT NOT NULL,     -- the parameterized-replaceable d-tag value
+author BLOB NOT NULL,    -- pubkey of the first author seen for this (namespace, d-tag)
+first_seen INTEGER NOT NULL, -- relay receive time of the first accepted binding
+PRIMARY KEY (namespace, d_tag)
+);
 
 
 "##,
@@ -244,6 +254,9 @@ pub fn upgrade_db(conn: &mut PooledConnection) -> Result<usize> {
             }
             if curr_version == 17 {
                 curr_version = mig_17_to_18(conn)?;
+            }
+            if curr_version == 18 {
+                curr_version = mig_18_to_19(conn)?;
             }
 
             if curr_version == DB_VERSION {
@@ -838,4 +851,45 @@ PRAGMA user_version = 18;
         }
     }
     Ok(18)
+}
+
+fn mig_18_to_19(conn: &mut PooledConnection) -> Result<usize> {
+    info!("database schema needs update from 18->19");
+    // UNIP-01: introduce the single-owner ownership table and backfill it from
+    // existing Unicity nametag bindings. Ownership is assigned to the author the
+    // relay saw FIRST (MIN(first_seen)), i.e. by relay receive time — never by
+    // the events' self-asserted created_at. Legacy bindings are identified by
+    // their content marker ("nametag_hash"), since the multi-char "nametag" tag
+    // is not stored in the (single-char) tag index. See docs/UNIP-01.md.
+    let upgrade_sql = r##"
+CREATE TABLE IF NOT EXISTS namespace_owner (
+namespace TEXT NOT NULL,
+d_tag TEXT NOT NULL,
+author BLOB NOT NULL,
+first_seen INTEGER NOT NULL,
+PRIMARY KEY (namespace, d_tag)
+);
+
+INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen)
+SELECT 'unicity:nametag', dt.value, e.author, MIN(e.first_seen)
+FROM event e
+JOIN tag dt ON dt.event_id = e.id AND dt.name = 'd'
+WHERE e.kind = 30078
+  AND e.content LIKE '%nametag_hash%'
+  AND dt.value IS NOT NULL
+GROUP BY dt.value;
+
+pragma optimize;
+PRAGMA user_version = 19;
+"##;
+    match conn.execute_batch(upgrade_sql) {
+        Ok(()) => {
+            info!("database schema upgraded v18 -> v19");
+        }
+        Err(err) => {
+            error!("update (v18->v19) failed: {}", err);
+            panic!("database could not be upgraded");
+        }
+    }
+    Ok(19)
 }
