@@ -1,6 +1,6 @@
 # UNIP-01: Single-Owner Identity Bindings
 
-`draft` `optional`
+`active` `optional`
 
 Unicity NIP — a Unicity-specific extension layered on the Nostr protocol.
 
