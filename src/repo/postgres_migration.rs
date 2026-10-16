@@ -640,10 +640,10 @@ mod m009 {
 
     /// UNIP-01: re-run the m008 nametag backfill. Until legacy (unmarked)
     /// nametag bindings were also recorded on ingest, one stored after m008
-    /// left its d-tag without an owner. Candidates are selected with the same
-    /// check ingest uses (Event::legacy_nametag_claim) and visited in relay
-    /// receive order, so each unowned d-tag goes to the author seen first.
-    /// ON CONFLICT DO NOTHING keeps existing owners.
+    /// left its d-tag without an owner. Candidates are the nametag claims
+    /// ingest records (Event::uniqueness_claim, Event::legacy_nametag_claim),
+    /// visited in relay receive order, so each unowned d-tag goes to the
+    /// author seen first. ON CONFLICT DO NOTHING keeps existing owners.
     struct LegacyNametagBackfill;
 
     #[async_trait]
@@ -659,7 +659,8 @@ mod m009 {
                 .execute(
                     r#"DECLARE m009_legacy_nametags NO SCROLL CURSOR FOR
 SELECT "content", pub_key, first_seen FROM "event"
-WHERE kind = 30078 AND position('nametag_hash' in convert_from("content", 'UTF8')) > 0
+WHERE (kind = 30078 AND position('nametag_hash' in convert_from("content", 'UTF8')) > 0)
+   OR (kind BETWEEN 30000 AND 39999 AND position('unicity:nametag' in convert_from("content", 'UTF8')) > 0)
 ORDER BY first_seen, id"#,
                 )
                 .await
@@ -677,7 +678,11 @@ ORDER BY first_seen, id"#,
                 for (content, author, first_seen) in rows {
                     let Some((namespace, d_tag)) = serde_json::from_slice::<Event>(&content)
                         .ok()
-                        .and_then(|event| event.legacy_nametag_claim(&namespaces))
+                        .and_then(|event| {
+                            event
+                                .uniqueness_claim(&namespaces)
+                                .or_else(|| event.legacy_nametag_claim(&namespaces))
+                        })
                     else {
                         continue;
                     };

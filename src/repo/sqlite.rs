@@ -2130,6 +2130,54 @@ mod tests {
         );
     }
 
+    /// The v19 backfill keyed every text d-tag as '' on SQLite, so marked
+    /// bindings stored before it ran have no usable owner either; v20 repairs
+    /// them too. An event labelled with a different namespace gets no
+    /// nametag owner.
+    #[test]
+    fn unip01_rebackfill_repairs_marked_bindings() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let marked_a = unip01_binding(
+            &"12".repeat(32),
+            &author_a,
+            "nm7",
+            true,
+            "{\"nametag_hash\":\"nm7\"}",
+        );
+        let mut other_ns = unip01_binding(
+            &"34".repeat(32),
+            &"bb".repeat(32),
+            "oth1",
+            false,
+            "{\"nametag_hash\":\"oth1\"}",
+        );
+        other_ns
+            .tags
+            .push(vec!["L".to_owned(), "other:ns".to_owned()]);
+        for e in [&marked_a, &other_ns] {
+            assert_eq!(SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(), 1);
+        }
+        // State left by the v19 backfill: the owner keyed as '' instead of the d-tag.
+        conn.execute_batch(
+            "UPDATE namespace_owner SET d_tag = '' WHERE d_tag = 'nm7'; PRAGMA user_version = 19;",
+        )
+        .unwrap();
+        assert_eq!(unip01_owner(&conn, "nm7"), None);
+
+        upgrade_db(&mut conn).unwrap();
+        assert_eq!(
+            unip01_owner(&conn, "nm7"),
+            Some(hex::decode(&author_a).unwrap())
+        );
+        assert_eq!(unip01_owner(&conn, "oth1"), None);
+    }
+
     /// The re-backfill selects legacy bindings exactly as ingest does: an
     /// event whose content merely mentions `nametag_hash` gets no owner.
     #[test]

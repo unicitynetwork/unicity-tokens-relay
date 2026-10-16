@@ -901,24 +901,30 @@ fn mig_19_to_20(conn: &mut PooledConnection) -> Result<usize> {
     info!("database schema needs update from 19->20");
     // UNIP-01: re-run the v19 nametag backfill. Until legacy (unmarked) nametag
     // bindings were also recorded on ingest, one stored after the v19 backfill
-    // left its d-tag without an owner. Candidates are selected with the same
-    // check ingest uses (Event::legacy_nametag_claim) and visited in relay
-    // receive order, so each unowned d-tag goes to the author seen first.
-    // INSERT OR IGNORE keeps existing owners.
+    // left its d-tag without an owner; and the v19 backfill itself keyed every
+    // text d-tag as '' (SQLite's hex(NULL) is '', not NULL), so no binding it
+    // saw, marked or not, got a usable owner. Candidates are the nametag claims
+    // ingest records (Event::uniqueness_claim, Event::legacy_nametag_claim),
+    // visited in relay receive order, so each unowned d-tag goes to the author
+    // seen first. INSERT OR IGNORE keeps existing owners.
     let start = Instant::now();
     let namespaces = vec![UNICITY_NAMETAG_NAMESPACE.to_owned()];
     let tx = conn.transaction()?;
     let mut recorded = 0;
     {
         let mut stmt = tx.prepare(
-            "SELECT content, author, first_seen FROM event WHERE kind = 30078 AND content LIKE '%nametag_hash%' ORDER BY first_seen, id;",
+            "SELECT content, author, first_seen FROM event WHERE (kind = 30078 AND content LIKE '%nametag_hash%') OR (kind BETWEEN 30000 AND 39999 AND content LIKE '%unicity:nametag%') ORDER BY first_seen, id;",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let event_json: String = row.get(0)?;
             let Some((namespace, d_tag)) = serde_json::from_str::<Event>(&event_json)
                 .ok()
-                .and_then(|event| event.legacy_nametag_claim(&namespaces))
+                .and_then(|event| {
+                    event
+                        .uniqueness_claim(&namespaces)
+                        .or_else(|| event.legacy_nametag_claim(&namespaces))
+                })
             else {
                 continue;
             };
