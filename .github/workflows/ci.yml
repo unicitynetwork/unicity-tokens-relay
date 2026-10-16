@@ -11,6 +11,19 @@ on:
 jobs:
   test_nostr-rs-relay:
     runs-on: ubuntu-latest
+    services:
+      # Production runs on Postgres (RDS 16); the Postgres repo tests run against this.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v3
 
@@ -36,6 +49,12 @@ jobs:
         run: |
           cargo check
           cargo test --all
+
+      - name: Test (Postgres)
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: |
+          cargo test --lib postgres_tests -- --ignored
 
       - name: Build
         run: |
