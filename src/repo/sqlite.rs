@@ -177,6 +177,14 @@ impl SqliteRepo {
                     "nametag is owned by another key".to_owned(),
                 ));
             }
+        } else if let Some((namespace, d_tag)) = e.legacy_nametag_claim(uniqueness_namespaces) {
+            // An unmarked legacy nametag binding is not subject to enforcement,
+            // but it does record its author as owner when there is none yet,
+            // as the migration backfill does for bindings stored before UNIP-01.
+            tx.execute(
+                "INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES (?1, ?2, ?3, strftime('%s','now'));",
+                params![namespace, d_tag, pubkey_blob],
+            )?;
         }
         // check for replaceable events that would hide this one; we won't even attempt to insert these.
         if e.is_replaceable() {
@@ -1953,5 +1961,223 @@ mod tests {
         assert_eq!(SqliteRepo::persist_event(&mut conn, &a, &ns).unwrap(), 1);
         // unmarked binding from a different author is stored (not blocked)
         assert_eq!(SqliteRepo::persist_event(&mut conn, &b, &ns).unwrap(), 1);
+    }
+
+    fn unip01_binding(id: &str, author: &str, d_tag: &str, marked: bool, content: &str) -> Event {
+        let mut tags = vec![vec!["d".to_owned(), d_tag.to_owned()]];
+        if marked {
+            tags.push(vec!["L".to_owned(), "unicity:nametag".to_owned()]);
+        }
+        Event {
+            id: id.to_owned(),
+            pubkey: author.to_owned(),
+            delegated_by: None,
+            created_at: 1_700_000_000,
+            kind: 30078,
+            tags,
+            content: content.to_owned(),
+            sig: "00".to_owned(),
+            tagidx: None,
+        }
+    }
+
+    fn unip01_owner(conn: &PooledConnection, d_tag: &str) -> Option<Vec<u8>> {
+        conn.query_row(
+            "SELECT author FROM namespace_owner WHERE namespace='unicity:nametag' AND d_tag=?1;",
+            params![d_tag],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// An unmarked (legacy-format) nametag binding records its author as owner
+    /// when the identifier has none, exactly as the migration backfill does for
+    /// bindings stored before UNIP-01, so a later marked binding from a
+    /// different author cannot take the identifier over.
+    #[test]
+    fn unip01_legacy_binding_records_owner() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let content = "{\"nametag_hash\":\"nm3\"}";
+
+        let legacy_a = unip01_binding(&"66".repeat(32), &author_a, "nm3", false, content);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &legacy_a, &ns).unwrap(),
+            1
+        );
+        assert_eq!(
+            unip01_owner(&conn, "nm3"),
+            Some(hex::decode(&author_a).unwrap())
+        );
+
+        let marked_b = unip01_binding(&"77".repeat(32), &author_b, "nm3", true, content);
+        assert!(
+            matches!(
+                SqliteRepo::persist_event(&mut conn, &marked_b, &ns),
+                Err(crate::error::Error::EventBlocked(_))
+            ),
+            "a marked binding from a different author must be blocked"
+        );
+
+        // The legacy owner can move to a marked binding.
+        let mut marked_a = unip01_binding(&"88".repeat(32), &author_a, "nm3", true, content);
+        marked_a.created_at += 1;
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &marked_a, &ns).unwrap(),
+            1
+        );
+        assert_eq!(
+            unip01_owner(&conn, "nm3"),
+            Some(hex::decode(&author_a).unwrap())
+        );
+    }
+
+    /// A legacy binding never replaces a recorded owner, and is itself still
+    /// stored: enforcement stays opt-in via the marker.
+    #[test]
+    fn unip01_legacy_binding_keeps_existing_owner() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let content = "{\"nametag_hash\":\"nm4\"}";
+
+        let marked_a = unip01_binding(&"99".repeat(32), &author_a, "nm4", true, content);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &marked_a, &ns).unwrap(),
+            1
+        );
+
+        let legacy_b = unip01_binding(&"aa".repeat(32), &author_b, "nm4", false, content);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &legacy_b, &ns).unwrap(),
+            1
+        );
+        assert_eq!(
+            unip01_owner(&conn, "nm4"),
+            Some(hex::decode(&author_a).unwrap())
+        );
+    }
+
+    /// Legacy bindings stored while the relay recorded no runtime ownership for
+    /// them (after the v19 backfill, before legacy bindings were recorded on
+    /// ingest) get an owner from the v20 re-backfill: the author the relay saw
+    /// first. Recorded owners stay.
+    #[test]
+    fn unip01_rebackfill_records_unowned_legacy_bindings() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let author_c = "cc".repeat(32);
+
+        let marked_a = unip01_binding(
+            &"cc".repeat(32),
+            &author_a,
+            "nm5",
+            true,
+            "{\"nametag_hash\":\"nm5\"}",
+        );
+        let legacy_b = unip01_binding(
+            &"dd".repeat(32),
+            &author_b,
+            "nm6",
+            false,
+            "{\"nametag_hash\":\"nm6\"}",
+        );
+        let legacy_c = unip01_binding(
+            &"ee".repeat(32),
+            &author_c,
+            "nm6",
+            false,
+            "{\"nametag_hash\":\"nm6\"}",
+        );
+        for e in [&marked_a, &legacy_b, &legacy_c] {
+            assert_eq!(SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(), 1);
+        }
+        // The relay saw C's binding first, although it was inserted last.
+        conn.execute_batch(
+            "UPDATE event SET first_seen = 2000 WHERE author = x'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+             UPDATE event SET first_seen = 1000 WHERE author = x'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+             DELETE FROM namespace_owner WHERE d_tag = 'nm6';
+             PRAGMA user_version = 19;",
+        )
+        .unwrap();
+        assert_eq!(unip01_owner(&conn, "nm6"), None);
+
+        upgrade_db(&mut conn).unwrap();
+        assert_eq!(
+            unip01_owner(&conn, "nm5"),
+            Some(hex::decode(&author_a).unwrap())
+        );
+        assert_eq!(
+            unip01_owner(&conn, "nm6"),
+            Some(hex::decode(&author_c).unwrap())
+        );
+    }
+
+    /// The re-backfill selects legacy bindings exactly as ingest does: an
+    /// event whose content merely mentions `nametag_hash` gets no owner.
+    #[test]
+    fn unip01_rebackfill_ignores_non_bindings() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let other = unip01_binding(
+            &"ff".repeat(32),
+            &"aa".repeat(32),
+            "app1",
+            false,
+            "{\"note\":\"nametag_hash\"}",
+        );
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &other, &ns).unwrap(),
+            1
+        );
+        conn.execute_batch("PRAGMA user_version = 19;").unwrap();
+
+        upgrade_db(&mut conn).unwrap();
+        assert_eq!(unip01_owner(&conn, "app1"), None);
+    }
+
+    /// Kind-30078 events that are not nametag bindings (here, a nametag-less
+    /// identity binding) record no ownership.
+    #[test]
+    fn unip01_non_nametag_app_data_records_no_owner() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let identity = unip01_binding(
+            &"bb".repeat(32),
+            &"aa".repeat(32),
+            "id1",
+            false,
+            "{\"public_key\":\"02ab\"}",
+        );
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &identity, &ns).unwrap(),
+            1
+        );
+        assert_eq!(unip01_owner(&conn, "id1"), None);
     }
 }

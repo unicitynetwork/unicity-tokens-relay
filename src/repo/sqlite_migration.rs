@@ -1,7 +1,7 @@
 //! Database schema and migrations
 use crate::db::PooledConnection;
 use crate::error::Result;
-use crate::event::{single_char_tagname, Event};
+use crate::event::{single_char_tagname, Event, UNICITY_NAMETAG_NAMESPACE};
 use crate::utils::is_lower_hex;
 use const_format::formatcp;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,7 +23,7 @@ pragma mmap_size = 0; -- disable mmap (default)
 "##;
 
 /// Latest database version
-pub const DB_VERSION: usize = 19;
+pub const DB_VERSION: usize = 20;
 
 /// Schema definition
 const INIT_SQL: &str = formatcp!(
@@ -257,6 +257,9 @@ pub fn upgrade_db(conn: &mut PooledConnection) -> Result<usize> {
             }
             if curr_version == 18 {
                 curr_version = mig_18_to_19(conn)?;
+            }
+            if curr_version == 19 {
+                curr_version = mig_19_to_20(conn)?;
             }
 
             if curr_version == DB_VERSION {
@@ -892,4 +895,46 @@ PRAGMA user_version = 19;
         }
     }
     Ok(19)
+}
+
+fn mig_19_to_20(conn: &mut PooledConnection) -> Result<usize> {
+    info!("database schema needs update from 19->20");
+    // UNIP-01: re-run the v19 nametag backfill. Until legacy (unmarked) nametag
+    // bindings were also recorded on ingest, one stored after the v19 backfill
+    // left its d-tag without an owner. Candidates are selected with the same
+    // check ingest uses (Event::legacy_nametag_claim) and visited in relay
+    // receive order, so each unowned d-tag goes to the author seen first.
+    // INSERT OR IGNORE keeps existing owners.
+    let start = Instant::now();
+    let namespaces = vec![UNICITY_NAMETAG_NAMESPACE.to_owned()];
+    let tx = conn.transaction()?;
+    let mut recorded = 0;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT content, author, first_seen FROM event WHERE kind = 30078 AND content LIKE '%nametag_hash%' ORDER BY first_seen, id;",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let event_json: String = row.get(0)?;
+            let Some((namespace, d_tag)) = serde_json::from_str::<Event>(&event_json)
+                .ok()
+                .and_then(|event| event.legacy_nametag_claim(&namespaces))
+            else {
+                continue;
+            };
+            let author: Vec<u8> = row.get(1)?;
+            let first_seen: i64 = row.get(2)?;
+            recorded += tx.execute(
+                "INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES (?1, ?2, ?3, ?4);",
+                params![namespace, d_tag, author, first_seen],
+            )?;
+        }
+    }
+    tx.execute("PRAGMA user_version = 20;", [])?;
+    tx.commit()?;
+    info!(
+        "database schema upgraded v19 -> v20 ({recorded} nametag owners recorded) in {:?}",
+        start.elapsed()
+    );
+    Ok(20)
 }
