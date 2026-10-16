@@ -170,6 +170,18 @@ impl NostrRepo for PostgresRepo {
                     "nametag is owned by another key".to_owned(),
                 ));
             }
+        } else if let Some((namespace, d_tag)) = e.legacy_nametag_claim(&self.uniqueness_namespaces)
+        {
+            // An unmarked legacy nametag binding is not subject to enforcement,
+            // but it does record its author as owner when there is none yet,
+            // as the migration backfill does for bindings stored before UNIP-01.
+            sqlx::query(
+                "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ($1, $2, $3) ON CONFLICT (namespace, d_tag) DO NOTHING;")
+                .bind(&namespace)
+                .bind(&d_tag)
+                .bind(&pubkey_blob)
+                .execute(&mut tx)
+                .await?;
         }
 
         // determine if this event would be shadowed by an existing

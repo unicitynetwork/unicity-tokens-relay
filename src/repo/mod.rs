@@ -11,6 +11,8 @@ use rand::Rng;
 
 pub mod postgres;
 pub mod postgres_migration;
+#[cfg(test)]
+mod postgres_tests;
 pub mod sqlite;
 pub mod sqlite_migration;
 

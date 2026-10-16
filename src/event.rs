@@ -26,6 +26,9 @@ lazy_static! {
     pub static ref SECP: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
 }
 
+/// UNIP-01 namespace of Unicity nametag bindings.
+pub const UNICITY_NAMETAG_NAMESPACE: &str = "unicity:nametag";
+
 /// Event command in network format.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct EventCmd {
@@ -368,6 +371,26 @@ impl Event {
             .into_iter()
             .find(|label| namespaces.iter().any(|ns| ns == label))
             .map(|ns| (ns, d_tag))
+    }
+
+    /// UNIP-01: if this event is a Unicity nametag binding in the pre-UNIP-01
+    /// format (kind 30078, no NIP-32 `L` label, JSON content with a
+    /// `nametag_hash` field) and `unicity:nametag` is a configured namespace,
+    /// return `("unicity:nametag", d_tag)`. These are the bindings the
+    /// migration backfill assigns owners to; recording them at runtime too
+    /// keeps a nametag first published in the legacy format from being claimed
+    /// by a different author's marked binding. Returns `None` otherwise.
+    #[must_use]
+    pub fn legacy_nametag_claim(&self, namespaces: &[String]) -> Option<(String, String)> {
+        if self.kind != 30078
+            || !namespaces.iter().any(|ns| ns == UNICITY_NAMETAG_NAMESPACE)
+            || !self.tag_values_by_name("L").is_empty()
+        {
+            return None;
+        }
+        let content: Value = serde_json::from_str(&self.content).ok()?;
+        content.get("nametag_hash")?;
+        Some((UNICITY_NAMETAG_NAMESPACE.to_owned(), self.distinct_param()?))
     }
 
     /// Check if this event has a valid signature.
@@ -892,6 +915,68 @@ mod tests {
             vec!["L".to_owned(), "unicity:nametag".to_owned()],
         ];
         assert_eq!(event.uniqueness_claim(&[]), None);
+    }
+
+    // ---- UNIP-01: legacy_nametag_claim ----
+
+    fn legacy_nametag_event(content: &str) -> Event {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = vec![vec!["d".to_owned(), "abc".to_owned()]];
+        event.content = content.to_owned();
+        event
+    }
+
+    #[test]
+    fn legacy_nametag_claim_matches_unmarked_binding() {
+        let event = legacy_nametag_event(r#"{"nametag_hash":"abc","address":"x"}"#);
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(
+            event.legacy_nametag_claim(&ns),
+            Some(("unicity:nametag".to_owned(), "abc".to_owned()))
+        );
+    }
+
+    #[test]
+    fn legacy_nametag_claim_requires_nametag_hash() {
+        // A nametag-less identity binding shares kind 30078 but claims no nametag.
+        let event = legacy_nametag_event(r#"{"public_key":"02ab"}"#);
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.legacy_nametag_claim(&ns), None);
+    }
+
+    #[test]
+    fn legacy_nametag_claim_requires_json_content() {
+        let event = legacy_nametag_event("nametag_hash");
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.legacy_nametag_claim(&ns), None);
+    }
+
+    #[test]
+    fn legacy_nametag_claim_requires_app_data_kind() {
+        let mut event = legacy_nametag_event(r#"{"nametag_hash":"abc"}"#);
+        event.kind = 30001;
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.legacy_nametag_claim(&ns), None);
+    }
+
+    #[test]
+    fn legacy_nametag_claim_requires_no_label() {
+        // A labelled event is not a legacy binding, whichever namespace it names.
+        let ns = vec!["unicity:nametag".to_owned(), "other:ns".to_owned()];
+        for label in ["other:ns", "unicity:nametag", "unconfigured:ns"] {
+            let mut event = legacy_nametag_event(r#"{"nametag_hash":"abc"}"#);
+            event.tags.push(vec!["L".to_owned(), label.to_owned()]);
+            assert_eq!(event.legacy_nametag_claim(&ns), None, "label {label}");
+        }
+    }
+
+    #[test]
+    fn legacy_nametag_claim_requires_configured_namespace() {
+        let event = legacy_nametag_event(r#"{"nametag_hash":"abc"}"#);
+        assert_eq!(event.legacy_nametag_claim(&[]), None);
+        let other = vec!["other:ns".to_owned()];
+        assert_eq!(event.legacy_nametag_claim(&other), None);
     }
 
     // ---- UNIP-01: is_valid_timestamp past/future bounds ----

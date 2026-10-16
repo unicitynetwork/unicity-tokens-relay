@@ -40,6 +40,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     m006::run(db).await?;
     m007::run(db).await?;
     run_migration(m008::migration(), db).await;
+    run_migration(m009::migration(), db).await;
     Ok(current_version(db).await as usize)
 }
 
@@ -619,6 +620,90 @@ GROUP BY 1, 2
 ON CONFLICT (namespace, d_tag) DO NOTHING;
                 "#,
             ],
+        }
+    }
+}
+
+mod m009 {
+    use crate::event::{Event, UNICITY_NAMETAG_NAMESPACE};
+    use crate::repo::postgres_migration::Migration;
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use sqlx::{Executor, Postgres, Transaction};
+    use tracing::info;
+
+    pub const VERSION: i64 = 9;
+
+    pub fn migration() -> impl Migration {
+        LegacyNametagBackfill
+    }
+
+    /// UNIP-01: re-run the m008 nametag backfill. Until legacy (unmarked)
+    /// nametag bindings were also recorded on ingest, one stored after m008
+    /// left its d-tag without an owner. Candidates are the nametag claims
+    /// ingest records (Event::uniqueness_claim, Event::legacy_nametag_claim),
+    /// visited in relay receive order, so each unowned d-tag goes to the
+    /// author seen first. ON CONFLICT DO NOTHING keeps existing owners.
+    struct LegacyNametagBackfill;
+
+    #[async_trait]
+    impl Migration for LegacyNametagBackfill {
+        fn serial_number(&self) -> i64 {
+            VERSION
+        }
+
+        async fn run(&self, tx: &mut Transaction<Postgres>) {
+            let namespaces = vec![UNICITY_NAMETAG_NAMESPACE.to_owned()];
+            // A cursor keeps memory bounded on a large event history.
+            (&mut *tx)
+                .execute(
+                    r#"DECLARE m009_legacy_nametags NO SCROLL CURSOR FOR
+SELECT "content", pub_key, first_seen FROM "event"
+WHERE (kind = 30078 AND position('nametag_hash' in convert_from("content", 'UTF8')) > 0)
+   OR (kind BETWEEN 30000 AND 39999 AND position('unicity:nametag' in convert_from("content", 'UTF8')) > 0)
+ORDER BY first_seen, id"#,
+                )
+                .await
+                .unwrap();
+            let mut recorded = 0;
+            loop {
+                let rows: Vec<(Vec<u8>, Vec<u8>, DateTime<Utc>)> =
+                    sqlx::query_as("FETCH 1000 FROM m009_legacy_nametags")
+                        .fetch_all(&mut *tx)
+                        .await
+                        .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                for (content, author, first_seen) in rows {
+                    let Some((namespace, d_tag)) = serde_json::from_slice::<Event>(&content)
+                        .ok()
+                        .and_then(|event| {
+                            event
+                                .uniqueness_claim(&namespaces)
+                                .or_else(|| event.legacy_nametag_claim(&namespaces))
+                        })
+                    else {
+                        continue;
+                    };
+                    recorded += sqlx::query(
+                        "INSERT INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES ($1, $2, $3, $4) ON CONFLICT (namespace, d_tag) DO NOTHING;",
+                    )
+                    .bind(&namespace)
+                    .bind(&d_tag)
+                    .bind(&author)
+                    .bind(first_seen)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap()
+                    .rows_affected();
+                }
+            }
+            (&mut *tx)
+                .execute("CLOSE m009_legacy_nametags")
+                .await
+                .unwrap();
+            info!("m009: recorded {recorded} nametag owners");
         }
     }
 }
