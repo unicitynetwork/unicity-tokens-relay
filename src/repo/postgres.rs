@@ -1,7 +1,7 @@
 use crate::db::{QueryResult, SLOW_THRESHOLD};
 use crate::error;
 use crate::error::Result;
-use crate::event::{single_char_tagname, Event};
+use crate::event::{single_char_tagname, Event, UNICITY_NAMETAG_NAMESPACE};
 use crate::nip05::{Nip05Name, VerificationRecord};
 use crate::payment::{InvoiceInfo, InvoiceStatus};
 use crate::repo::postgres_migration::run_migrations;
@@ -182,6 +182,29 @@ impl NostrRepo for PostgresRepo {
                 .bind(&pubkey_blob)
                 .execute(&mut tx)
                 .await?;
+        }
+
+        // A kind 30078 event may refer to a nametag hash, by its d-tag or a
+        // t-tag, only if its author owns that nametag or nobody does. A
+        // binding's own d-tag was recorded above, so this also rejects a legacy
+        // binding from a non-owner.
+        let references = e.nametag_references(&self.uniqueness_namespaces);
+        if !references.is_empty() {
+            let owners: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag = ANY($2);",
+            )
+            .bind(UNICITY_NAMETAG_NAMESPACE)
+            .bind(&references)
+            .fetch_all(&mut tx)
+            .await?;
+            if owners
+                .iter()
+                .any(|owner| Some(owner) != pubkey_blob.as_ref())
+            {
+                return Err(error::Error::EventBlocked(
+                    "nametag is owned by another key".to_owned(),
+                ));
+            }
         }
 
         // determine if this event would be shadowed by an existing

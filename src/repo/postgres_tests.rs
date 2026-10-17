@@ -113,6 +113,11 @@ fn author_bytes(author: &str) -> Option<Vec<u8>> {
     Some(hex::decode(author).unwrap())
 }
 
+fn sha256_hex(input: &str) -> String {
+    use bitcoin_hashes::{sha256, Hash};
+    format!("{:x}", sha256::Hash::hash(input.as_bytes()))
+}
+
 #[tokio::test]
 #[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
 async fn marked_binding_has_single_owner() {
@@ -160,17 +165,151 @@ async fn legacy_binding_records_owner() {
 
 #[tokio::test]
 #[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
-async fn legacy_binding_keeps_existing_owner() {
+async fn legacy_binding_from_non_owner_is_rejected() {
     let db = TestDb::new().await;
     let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a3");
 
-    let marked_a = binding(&key("11"), &a, "nm3", MARKED, &nametag_content("nm3"));
+    let marked_a = binding(&key("11"), &a, &nm, MARKED, &nametag_content(&nm));
     assert_eq!(db.repo.write_event(&marked_a).await.unwrap(), 1);
 
-    // Still stored (enforcement is opt-in via the marker), but not the owner.
-    let legacy_b = binding(&key("22"), &b, "nm3", None, &nametag_content("nm3"));
-    assert_eq!(db.repo.write_event(&legacy_b).await.unwrap(), 1);
-    assert_eq!(db.owner("nm3").await, author_bytes(&a));
+    let legacy_b = binding(&key("22"), &b, &nm, None, &nametag_content(&nm));
+    assert!(matches!(
+        db.repo.write_event(&legacy_b).await,
+        Err(Error::EventBlocked(_))
+    ));
+    assert_eq!(db.owner(&nm).await, author_bytes(&a));
+    db.drop().await;
+}
+
+/// Only the owner of a nametag may refer to its hash from a kind-30078 event,
+/// by `d` tag or `t` tag, whatever else the event carries: resolvers fetch
+/// bindings by `#t` and match the `d` tag.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn other_authors_cannot_refer_to_owned_nametag() {
+    let db = TestDb::new().await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+    let t_tag = vec!["t".to_owned(), nm.clone()];
+
+    let owner = binding(&key("11"), &a, &nm, MARKED, &nametag_content(&nm));
+    assert_eq!(db.repo.write_event(&owner).await.unwrap(), 1);
+
+    // B's marked binding for its own nametag, also tagged with A's.
+    let other_nm = key("b2");
+    let mut marked_t = binding(&key("12"), &b, &other_nm, MARKED, "{}");
+    marked_t.tags.push(t_tag.clone());
+    let mut unmarked_t = binding(&key("13"), &b, &key("c3"), None, "{}");
+    unmarked_t.tags.push(t_tag.clone());
+    let not_a_binding = binding(&key("14"), &b, &nm, None, "x");
+    let other_label = binding(&key("15"), &b, &nm, Some("other:ns"), &nametag_content(&nm));
+    for e in [&marked_t, &unmarked_t, &not_a_binding, &other_label] {
+        assert!(
+            matches!(db.repo.write_event(e).await, Err(Error::EventBlocked(_))),
+            "event {} must be blocked",
+            e.id
+        );
+    }
+    // The rejected marked binding recorded no owner for B's nametag.
+    assert_eq!(db.owner(&other_nm).await, None);
+
+    // The owner may refer to its nametag from other events.
+    let mut identity = binding(
+        &key("16"),
+        &a,
+        &key("d4"),
+        None,
+        "{\"public_key\":\"02ab\"}",
+    );
+    identity.tags.push(t_tag);
+    assert_eq!(db.repo.write_event(&identity).await.unwrap(), 1);
+    assert_eq!(db.owner(&nm).await, author_bytes(&a));
+    db.drop().await;
+}
+
+/// A key that claims a victim's address hash or identity-binding d-tag as a
+/// nametag does not block the victim's bindings, which carry the address and
+/// are authored by the identity's key.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn claimed_address_and_identity_hashes_do_not_block_their_owner() {
+    let db = TestDb::new().await;
+    let (attacker, victim) = (key("cc"), key("dd"));
+    let address_hash = sha256_hex("unicity:address:DIRECT://v");
+    let identity_d = sha256_hex(&format!("unicity:identity:{victim}"));
+
+    let claim_address = binding(&key("31"), &attacker, &address_hash, MARKED, "{}");
+    let claim_identity = binding(&key("32"), &attacker, &identity_d, MARKED, "{}");
+    for e in [&claim_address, &claim_identity] {
+        assert_eq!(db.repo.write_event(e).await.unwrap(), 1);
+    }
+
+    let mut identity = binding(
+        &key("33"),
+        &victim,
+        &identity_d,
+        None,
+        "{\"direct_address\":\"DIRECT://v\"}",
+    );
+    identity
+        .tags
+        .push(vec!["t".to_owned(), address_hash.clone()]);
+    let nm = key("a5");
+    let mut nametag_binding = binding(
+        &key("34"),
+        &victim,
+        &nm,
+        MARKED,
+        &format!("{{\"nametag_hash\":\"{nm}\",\"address\":\"DIRECT://v\"}}"),
+    );
+    nametag_binding.tags.push(vec!["t".to_owned(), nm.clone()]);
+    nametag_binding
+        .tags
+        .push(vec!["t".to_owned(), address_hash]);
+    for e in [&identity, &nametag_binding] {
+        assert_eq!(
+            db.repo.write_event(e).await.unwrap(),
+            1,
+            "event {} must be stored",
+            e.id
+        );
+    }
+    db.drop().await;
+}
+
+/// References are checked only for owned identifiers in the nametag hash
+/// format, and only on kind-30078 events.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn unowned_and_non_hash_references_are_not_enforced() {
+    let db = TestDb::new().await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+
+    let plain = binding(&key("21"), &a, "settings", MARKED, "{}");
+    let owner = binding(&key("22"), &a, &nm, MARKED, "{}");
+    for e in [&plain, &owner] {
+        assert_eq!(db.repo.write_event(e).await.unwrap(), 1);
+    }
+
+    let mut same_plain_tags = binding(&key("23"), &b, "settings", None, "{}");
+    same_plain_tags
+        .tags
+        .push(vec!["t".to_owned(), "settings".to_owned()]);
+    let mut unowned_t = binding(&key("24"), &b, &key("e5"), None, "{}");
+    unowned_t.tags.push(vec!["t".to_owned(), key("f6")]);
+    let mut note = binding(&key("25"), &b, "x", None, "hi");
+    note.kind = 1;
+    note.tags.push(vec!["t".to_owned(), nm.clone()]);
+    for e in [&same_plain_tags, &unowned_t, &note] {
+        assert_eq!(
+            db.repo.write_event(e).await.unwrap(),
+            1,
+            "event {} must be stored",
+            e.id
+        );
+    }
     db.drop().await;
 }
 
