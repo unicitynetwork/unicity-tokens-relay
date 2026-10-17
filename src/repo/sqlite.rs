@@ -18,7 +18,6 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::types::ToSql;
 use rusqlite::OpenFlags;
-use rusqlite::OptionalExtension;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -190,19 +189,24 @@ impl SqliteRepo {
         // A kind 30078 event may refer to a nametag hash, by its d-tag or a
         // t-tag, only if its author owns that nametag or nobody does. A
         // binding's own d-tag was recorded above, so this also rejects a legacy
-        // binding from a non-owner.
-        for reference in e.nametag_references(uniqueness_namespaces) {
-            let owner: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT author FROM namespace_owner WHERE namespace=?1 AND d_tag=?2;",
-                    params![UNICITY_NAMETAG_NAMESPACE, reference],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if owner.is_some() && owner != pubkey_blob {
-                return Err(crate::error::Error::EventBlocked(
-                    "nametag is owned by another key".to_owned(),
-                ));
+        // binding from a non-owner. Looked up in batches, so an event with many
+        // references costs a few queries rather than one per reference.
+        let references = e.nametag_references(uniqueness_namespaces);
+        for batch in references.chunks(500) {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT author FROM namespace_owner WHERE namespace=? AND d_tag IN ({});",
+                repeat_vars(batch.len())
+            ))?;
+            let params =
+                std::iter::once(UNICITY_NAMETAG_NAMESPACE).chain(batch.iter().map(String::as_str));
+            let mut owners = stmt.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = owners.next()? {
+                let owner: Vec<u8> = row.get(0)?;
+                if Some(&owner) != pubkey_blob.as_ref() {
+                    return Err(crate::error::Error::EventBlocked(
+                        "nametag is owned by another key".to_owned(),
+                    ));
+                }
             }
         }
         // check for replaceable events that would hide this one; we won't even attempt to insert these.
@@ -2211,6 +2215,44 @@ mod tests {
                 e.id
             );
         }
+    }
+
+    /// An event with many references is checked in batches; an owned nametag
+    /// past the first batch still blocks it.
+    #[test]
+    fn unip01_references_are_checked_in_every_batch() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let nametag = "ff".repeat(32);
+        let owner = unip01_binding(&"41".repeat(32), &author_a, &nametag, true, "{}");
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &owner, &ns).unwrap(),
+            1
+        );
+
+        let unowned: Vec<Vec<String>> = (0..1200)
+            .map(|i| vec!["t".to_owned(), format!("{i:064x}")])
+            .collect();
+        let mut many = unip01_binding(&"42".repeat(32), &author_b, &"e5".repeat(32), false, "{}");
+        many.tags.extend(unowned.iter().cloned());
+        assert_eq!(SqliteRepo::persist_event(&mut conn, &many, &ns).unwrap(), 1);
+
+        let mut many_and_owned =
+            unip01_binding(&"43".repeat(32), &author_b, &"e6".repeat(32), false, "{}");
+        many_and_owned.tags.extend(unowned);
+        many_and_owned
+            .tags
+            .push(vec!["t".to_owned(), nametag.clone()]);
+        assert!(matches!(
+            SqliteRepo::persist_event(&mut conn, &many_and_owned, &ns),
+            Err(crate::error::Error::EventBlocked(_))
+        ));
     }
 
     /// References are checked only for owned identifiers in the nametag hash
