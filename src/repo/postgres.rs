@@ -16,7 +16,7 @@ use itertools::Itertools;
 use nostr::key::Keys;
 use sqlx::postgres::PgRow;
 use sqlx::Error::RowNotFound;
-use sqlx::{Error, Execute, FromRow, Postgres, QueryBuilder, Row};
+use sqlx::{Error, Execute, FromRow, Postgres, QueryBuilder, Row, Transaction};
 use std::ops::Deref;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
@@ -24,6 +24,12 @@ use tokio::sync::oneshot::Receiver;
 use tracing::{debug, error, info, trace, warn};
 
 pub type PostgresPool = sqlx::pool::Pool<Postgres>;
+
+/// Transaction-level advisory lock taken by every write that claims a
+/// `unicity:nametag` identifier or refers to one, so that across relay
+/// instances a nametag's first claim and a concurrent reference to it cannot
+/// miss each other's uncommitted rows. ASCII bytes for `unip01nt`.
+pub(crate) const NAMETAG_LOCK_KEY: i64 = 0x756e_6970_3031_6e74_i64;
 
 pub struct PostgresRepo {
     conn: PostgresPool,
@@ -124,7 +130,7 @@ impl NostrRepo for PostgresRepo {
     }
 
     async fn migrate_up(&self) -> Result<usize> {
-        Ok(run_migrations(&self.conn_write).await?)
+        Ok(run_migrations(&self.conn_write, &self.uniqueness_namespaces).await?)
     }
 
     async fn write_event(&self, e: &Event) -> Result<u64> {
@@ -149,14 +155,29 @@ impl NostrRepo for PostgresRepo {
         // (namespace_owner.first_seen DEFAULT now()), never the event's
         // self-asserted created_at. The upsert + re-select run in this
         // transaction so concurrent first-claims serialize on the primary key.
+        // `new_nametag` is set when this event records a nametag's first owner.
+        let references = e.nametag_references(&self.uniqueness_namespaces);
+        let nametag_claim = e
+            .legacy_nametag_claim(&self.uniqueness_namespaces)
+            .is_some()
+            || matches!(e.uniqueness_claim(&self.uniqueness_namespaces),
+                        Some((namespace, _)) if namespace == UNICITY_NAMETAG_NAMESPACE);
+        if nametag_claim || !references.is_empty() {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(NAMETAG_LOCK_KEY)
+                .execute(&mut tx)
+                .await?;
+        }
+        let mut new_nametag: Option<String> = None;
         if let Some((namespace, d_tag)) = e.uniqueness_claim(&self.uniqueness_namespaces) {
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ($1, $2, $3) ON CONFLICT (namespace, d_tag) DO NOTHING;")
                 .bind(&namespace)
                 .bind(&d_tag)
                 .bind(&pubkey_blob)
                 .execute(&mut tx)
-                .await?;
+                .await?
+                .rows_affected();
             let owner: Vec<u8> = sqlx::query_scalar(
                 "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag=$2;")
                 .bind(&namespace)
@@ -170,41 +191,40 @@ impl NostrRepo for PostgresRepo {
                     "nametag is owned by another key".to_owned(),
                 ));
             }
-        } else if let Some((namespace, d_tag)) = e.legacy_nametag_claim(&self.uniqueness_namespaces)
-        {
-            // An unmarked legacy nametag binding is not subject to enforcement,
-            // but it does record its author as owner when there is none yet,
-            // as the migration backfill does for bindings stored before UNIP-01.
-            sqlx::query(
+            if inserted == 1 && namespace == UNICITY_NAMETAG_NAMESPACE {
+                new_nametag = Some(d_tag);
+            }
+        } else if let Some((_, d_tag)) = e.legacy_nametag_claim(&self.uniqueness_namespaces) {
+            // An unmarked legacy nametag binding records its author as owner
+            // when there is none yet, as the migration backfill does for
+            // bindings stored before UNIP-01; one from a non-owner is rejected
+            // below.
+            let inserted = sqlx::query(
                 "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ($1, $2, $3) ON CONFLICT (namespace, d_tag) DO NOTHING;")
-                .bind(&namespace)
+                .bind(UNICITY_NAMETAG_NAMESPACE)
                 .bind(&d_tag)
                 .bind(&pubkey_blob)
                 .execute(&mut tx)
-                .await?;
+                .await?
+                .rows_affected();
+            if inserted == 1 {
+                new_nametag = Some(d_tag);
+            }
         }
 
         // A kind 30078 event may refer to a nametag hash, by its d-tag or a
         // t-tag, only if its author owns that nametag or nobody does. A
         // binding's own d-tag was recorded above, so this also rejects a legacy
         // binding from a non-owner.
-        let references = e.nametag_references(&self.uniqueness_namespaces);
-        if !references.is_empty() {
-            let owners: Vec<Vec<u8>> = sqlx::query_scalar(
-                "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag = ANY($2);",
-            )
-            .bind(UNICITY_NAMETAG_NAMESPACE)
-            .bind(&references)
-            .fetch_all(&mut tx)
-            .await?;
-            if owners
-                .iter()
-                .any(|owner| Some(owner) != pubkey_blob.as_ref())
-            {
-                return Err(error::Error::EventBlocked(
-                    "nametag is owned by another key".to_owned(),
-                ));
-            }
+        if owned_by_others(&mut tx, &references, &e.pubkey).await? {
+            return Err(error::Error::EventBlocked(
+                "nametag is owned by another key".to_owned(),
+            ));
+        }
+        // Events other keys stored before this nametag had an owner, referring
+        // to it, would have been rejected from now on; hide them.
+        if let Some(d_tag) = new_nametag {
+            hide_references_to_new_nametag(&mut tx, &d_tag, e, &self.uniqueness_namespaces).await?;
         }
 
         // determine if this event would be shadowed by an existing
@@ -939,6 +959,87 @@ LIMIT 1;
 }
 
 /// Create a dynamic SQL query and params from a subscription filter.
+/// UNIP-01: whether any of the nametag hashes `references` is owned by a key
+/// other than `author` (hex).
+async fn owned_by_others(
+    tx: &mut Transaction<'_, Postgres>,
+    references: &[String],
+    author: &str,
+) -> Result<bool> {
+    if references.is_empty() {
+        return Ok(false);
+    }
+    let author = hex::decode(author).ok();
+    let owners: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag = ANY($2);",
+    )
+    .bind(UNICITY_NAMETAG_NAMESPACE)
+    .bind(references)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(owners.iter().any(|owner| Some(owner) != author.as_ref()))
+}
+
+/// UNIP-01: whether `e` refers, by its d-tag or a t-tag, to a nametag owned by
+/// a key other than its author (see `Event::nametag_references`).
+async fn refers_to_others_nametag(
+    tx: &mut Transaction<'_, Postgres>,
+    e: &Event,
+    namespaces: &[String],
+) -> Result<bool> {
+    owned_by_others(tx, &e.nametag_references(namespaces), &e.pubkey).await
+}
+
+/// UNIP-01: hide each candidate, given as (event id, stored event JSON), that
+/// refers to a nametag owned by another key. Hidden events stay stored and are
+/// logged by id. Returns how many were hidden.
+pub(crate) async fn hide_references_to_owned_nametags(
+    tx: &mut Transaction<'_, Postgres>,
+    candidates: Vec<(Vec<u8>, Vec<u8>)>,
+    namespaces: &[String],
+) -> Result<u64> {
+    let mut hidden = 0;
+    for (id, content) in candidates {
+        let Ok(event) = serde_json::from_slice::<Event>(&content) else {
+            continue;
+        };
+        if refers_to_others_nametag(tx, &event, namespaces).await? {
+            sqlx::query("UPDATE \"event\" SET hidden = 1::bit(1) WHERE id = $1")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            info!(
+                "UNIP-01: hid event {}, which refers to a nametag owned by another key",
+                event.id
+            );
+            hidden += 1;
+        }
+    }
+    Ok(hidden)
+}
+
+/// UNIP-01: `owner_event` just recorded the first owner of nametag `d_tag`.
+/// Hide the kind 30078 events other keys stored earlier that refer to it.
+async fn hide_references_to_new_nametag(
+    tx: &mut Transaction<'_, Postgres>,
+    d_tag: &str,
+    owner_event: &Event,
+    namespaces: &[String],
+) -> Result<u64> {
+    if d_tag.len() != 64 || !is_lower_hex(d_tag) {
+        return Ok(0);
+    }
+    let candidates: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT DISTINCT e.id, e.\"content\" FROM tag t JOIN \"event\" e ON e.id = t.event_id \
+         WHERE t.\"name\" IN ('d', 't') AND t.value_hex = $1 AND e.kind = 30078 AND e.pub_key != $2 AND e.hidden != 1::bit(1);",
+    )
+    .bind(hex::decode(d_tag).ok())
+    .bind(hex::decode(&owner_event.pubkey).ok())
+    .fetch_all(&mut *tx)
+    .await?;
+    hide_references_to_owned_nametags(tx, candidates, namespaces).await
+}
+
 fn query_from_filter(f: &'_ ReqFilter) -> Option<QueryBuilder<'_, Postgres>> {
     // if the filter is malformed, don't return anything.
     if f.force_no_match {

@@ -26,8 +26,12 @@ impl Migration for SimpleSqlMigration {
     }
 }
 
-/// Execute all migrations on the database.
-pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
+/// Execute all migrations on the database. `uniqueness_namespaces` is the
+/// configured UNIP-01 namespaces (`authorization.uniqueness_namespaces`).
+pub async fn run_migrations(
+    db: &PostgresPool,
+    uniqueness_namespaces: &[String],
+) -> crate::error::Result<usize> {
     prepare_migrations_table(db).await;
     run_migration(m001::migration(), db).await;
     let m002_result = run_migration(m002::migration(), db).await;
@@ -41,6 +45,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     m007::run(db).await?;
     run_migration(m008::migration(), db).await;
     run_migration(m009::migration(), db).await;
+    run_migration(m010::migration(uniqueness_namespaces), db).await;
     Ok(current_version(db).await as usize)
 }
 
@@ -704,6 +709,89 @@ ORDER BY first_seen, id"#,
                 .await
                 .unwrap();
             info!("m009: recorded {recorded} nametag owners");
+        }
+    }
+}
+
+mod m010 {
+    use crate::event::UNICITY_NAMETAG_NAMESPACE;
+    use crate::repo::postgres::hide_references_to_owned_nametags;
+    use crate::repo::postgres_migration::Migration;
+    use async_trait::async_trait;
+    use sqlx::{Executor, Postgres, Transaction};
+    use tracing::info;
+
+    pub const VERSION: i64 = 10;
+
+    pub fn migration(uniqueness_namespaces: &[String]) -> impl Migration {
+        HideNametagReferences {
+            namespaces: uniqueness_namespaces.to_vec(),
+        }
+    }
+
+    /// UNIP-01: hide stored kind 30078 events that refer, by d-tag or t-tag, to
+    /// a nametag owned by another key. Ingest rejects such events, and hides
+    /// earlier ones when a nametag gets its first owner; this applies the same
+    /// rule to events stored before either did. Candidates are events with a
+    /// d or t tag equal to an owned nametag hash and a different author;
+    /// `Event::nametag_references` then decides, with its exemptions. Hidden
+    /// events stay stored and are logged by id. Nothing is hidden unless
+    /// `unicity:nametag` is a configured namespace; a relay that enables it
+    /// later can re-run this migration (`DELETE FROM migrations WHERE
+    /// serial_number = 10`).
+    struct HideNametagReferences {
+        namespaces: Vec<String>,
+    }
+
+    #[async_trait]
+    impl Migration for HideNametagReferences {
+        fn serial_number(&self) -> i64 {
+            VERSION
+        }
+
+        async fn run(&self, tx: &mut Transaction<Postgres>) {
+            if !self
+                .namespaces
+                .iter()
+                .any(|ns| ns == UNICITY_NAMETAG_NAMESPACE)
+            {
+                info!("m010: {UNICITY_NAMETAG_NAMESPACE} is not enforced; nothing hidden");
+                return;
+            }
+            // MATERIALIZED applies the hash-format filter before decode().
+            (&mut *tx)
+                .execute(
+                    r#"DECLARE m010_nametag_references NO SCROLL CURSOR FOR
+WITH owners AS MATERIALIZED (
+  SELECT decode(d_tag, 'hex') AS hash, author FROM namespace_owner
+  WHERE namespace = 'unicity:nametag' AND d_tag ~ '^[0-9a-f]{64}$'
+)
+SELECT DISTINCT e.id, e."content" FROM owners o
+JOIN tag t ON t.value_hex = o.hash AND t."name" IN ('d', 't')
+JOIN "event" e ON e.id = t.event_id
+WHERE e.kind = 30078 AND e.pub_key <> o.author AND e.hidden != 1::bit(1)"#,
+                )
+                .await
+                .unwrap();
+            let mut hidden = 0;
+            loop {
+                let rows: Vec<(Vec<u8>, Vec<u8>)> =
+                    sqlx::query_as("FETCH 1000 FROM m010_nametag_references")
+                        .fetch_all(&mut *tx)
+                        .await
+                        .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                hidden += hide_references_to_owned_nametags(tx, rows, &self.namespaces)
+                    .await
+                    .unwrap();
+            }
+            (&mut *tx)
+                .execute("CLOSE m010_nametag_references")
+                .await
+                .unwrap();
+            info!("m010: hid {hidden} events referring to nametags owned by another key");
         }
     }
 }

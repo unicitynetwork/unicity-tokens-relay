@@ -7,6 +7,7 @@
 
 use crate::error::Error;
 use crate::event::Event;
+use crate::repo::postgres::NAMETAG_LOCK_KEY;
 use crate::repo::postgres::{PostgresPool, PostgresRepo};
 use crate::repo::NostrRepo;
 use crate::server::create_metrics;
@@ -23,6 +24,10 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> TestDb {
+        TestDb::with_namespaces(vec!["unicity:nametag".to_owned()]).await
+    }
+
+    async fn with_namespaces(uniqueness_namespaces: Vec<String>) -> TestDb {
         let url = std::env::var("TEST_POSTGRES_URL")
             .expect("TEST_POSTGRES_URL must point at a Postgres server for these tests");
         let admin: PgConnectOptions = url.parse().unwrap();
@@ -42,7 +47,7 @@ impl TestDb {
             pool.clone(),
             metrics,
             false,
-            vec!["unicity:nametag".to_owned()],
+            uniqueness_namespaces,
         );
         repo.migrate_up().await.unwrap();
         TestDb {
@@ -61,6 +66,23 @@ impl TestDb {
         .fetch_optional(&self.pool)
         .await
         .unwrap()
+    }
+
+    async fn hidden(&self, id: &str) -> bool {
+        sqlx::query_scalar("SELECT hidden = 1::bit(1) FROM \"event\" WHERE id = $1")
+            .bind(hex::decode(id).unwrap())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn rerun_migration(&self, serial_number: i64) {
+        sqlx::query("DELETE FROM migrations WHERE serial_number = $1")
+            .bind(serial_number)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        self.repo.migrate_up().await.unwrap();
     }
 
     /// Re-run m009 as an operator would: forget it was applied, then migrate.
@@ -274,6 +296,177 @@ async fn claimed_address_and_identity_hashes_do_not_block_their_owner() {
             "event {} must be stored",
             e.id
         );
+    }
+    db.drop().await;
+}
+
+/// Events another key stored before a nametag had an owner, referring to it by
+/// d-tag or t-tag, are hidden when the nametag gets its first owner.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn first_owner_hides_earlier_references() {
+    let db = TestDb::new().await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+    let t_tag = vec!["t".to_owned(), nm.clone()];
+
+    let mut tagged = binding(&key("11"), &b, &key("b2"), None, "{}");
+    tagged.tags.push(t_tag.clone());
+    let mut marked_tagged = binding(&key("12"), &b, &key("b3"), MARKED, "{}");
+    marked_tagged.tags.push(t_tag.clone());
+    let same_d = binding(&key("13"), &b, &nm, None, "x");
+    let unrelated = binding(&key("14"), &b, &key("b4"), None, "{}");
+    let mut note = binding(&key("15"), &b, "x", None, "hi");
+    note.kind = 1;
+    note.tags.push(t_tag);
+    for e in [&tagged, &marked_tagged, &same_d, &unrelated, &note] {
+        assert_eq!(db.repo.write_event(e).await.unwrap(), 1);
+    }
+
+    let owner = binding(&key("16"), &a, &nm, MARKED, &nametag_content(&nm));
+    assert_eq!(db.repo.write_event(&owner).await.unwrap(), 1);
+    for e in [&tagged, &marked_tagged, &same_d] {
+        assert!(db.hidden(&e.id).await, "event {} must be hidden", e.id);
+    }
+    for e in [&unrelated, &note, &owner] {
+        assert!(!db.hidden(&e.id).await, "event {} must stay visible", e.id);
+    }
+    db.drop().await;
+}
+
+/// Claiming a victim's address hash or identity-binding d-tag as a nametag
+/// does not hide the victim's bindings that carry them.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn first_owner_does_not_hide_exempt_references() {
+    let db = TestDb::new().await;
+    let (attacker, victim) = (key("cc"), key("dd"));
+    let address_hash = sha256_hex("unicity:address:DIRECT://v");
+    let identity_d = sha256_hex(&format!("unicity:identity:{victim}"));
+
+    let mut identity = binding(
+        &key("21"),
+        &victim,
+        &identity_d,
+        None,
+        "{\"direct_address\":\"DIRECT://v\"}",
+    );
+    identity
+        .tags
+        .push(vec!["t".to_owned(), address_hash.clone()]);
+    assert_eq!(db.repo.write_event(&identity).await.unwrap(), 1);
+
+    let claim_address = binding(&key("22"), &attacker, &address_hash, MARKED, "{}");
+    let claim_identity = binding(&key("23"), &attacker, &identity_d, MARKED, "{}");
+    for e in [&claim_address, &claim_identity] {
+        assert_eq!(db.repo.write_event(e).await.unwrap(), 1);
+    }
+    assert!(!db.hidden(&identity.id).await);
+    db.drop().await;
+}
+
+/// m010 hides stored events that refer to a nametag owned by another key,
+/// leaving the owner's events and exempt references visible.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn rehide_hides_stored_references_to_owned_nametags() {
+    let db = TestDb::new().await;
+    let (a, b, c, m, v) = (key("aa"), key("bb"), key("cc"), key("ee"), key("dd"));
+    let nm = key("a1");
+    let address_hash = sha256_hex("unicity:address:DIRECT://v");
+
+    let mut tagged = binding(&key("31"), &b, &key("b2"), None, "{}");
+    tagged.tags.push(vec!["t".to_owned(), nm.clone()]);
+    let same_d = binding(&key("32"), &c, &nm, None, "x");
+    let mut owners_own = binding(&key("33"), &a, &key("a2"), None, "{}");
+    owners_own.tags.push(vec!["t".to_owned(), nm.clone()]);
+    let mut identity = binding(
+        &key("34"),
+        &v,
+        &key("d1"),
+        None,
+        "{\"direct_address\":\"DIRECT://v\"}",
+    );
+    identity
+        .tags
+        .push(vec!["t".to_owned(), address_hash.clone()]);
+    for e in [&tagged, &same_d, &owners_own, &identity] {
+        assert_eq!(db.repo.write_event(e).await.unwrap(), 1);
+    }
+    // Owners recorded without ingest seeing a claim, as for names owned before
+    // first claims hid references.
+    for (d_tag, author) in [(&nm, &a), (&address_hash, &m)] {
+        sqlx::query("INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ('unicity:nametag', $1, $2)")
+            .bind(d_tag)
+            .bind(hex::decode(author).unwrap())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    db.rerun_migration(10).await;
+    for e in [&tagged, &same_d] {
+        assert!(db.hidden(&e.id).await, "event {} must be hidden", e.id);
+    }
+    for e in [&owners_own, &identity] {
+        assert!(!db.hidden(&e.id).await, "event {} must stay visible", e.id);
+    }
+    db.drop().await;
+}
+
+/// With enforcement disabled (no configured namespaces), m010 hides nothing.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn rehide_skips_disabled_enforcement() {
+    let db = TestDb::with_namespaces(Vec::new()).await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+
+    let mut tagged = binding(&key("41"), &b, &key("b2"), None, "{}");
+    tagged.tags.push(vec!["t".to_owned(), nm.clone()]);
+    assert_eq!(db.repo.write_event(&tagged).await.unwrap(), 1);
+    sqlx::query(
+        "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ('unicity:nametag', $1, $2)",
+    )
+    .bind(&nm)
+    .bind(hex::decode(&a).unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.rerun_migration(10).await;
+    assert!(!db.hidden(&tagged.id).await);
+    db.drop().await;
+}
+
+/// A nametag claim and an event referring to a nametag wait for the nametag
+/// lock, which serializes them across relay instances; other app data does not.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn nametag_writes_take_the_nametag_lock() {
+    let db = TestDb::new().await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+    let claim = binding(&key("51"), &a, &nm, MARKED, &nametag_content(&nm));
+    let mut reference = binding(&key("52"), &b, &key("b2"), None, "{}");
+    reference.tags.push(vec!["t".to_owned(), key("c3")]);
+    let unrelated = binding(&key("53"), &b, "settings", None, "{}");
+
+    for (e, waits) in [(&claim, true), (&reference, true), (&unrelated, false)] {
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(NAMETAG_LOCK_KEY)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let write = db.repo.write_event(e);
+        tokio::pin!(write);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut write).await;
+        assert_eq!(early.is_err(), waits, "event {}", e.id);
+        holder.commit().await.unwrap();
+        if waits {
+            assert_eq!(write.await.unwrap(), 1);
+        }
     }
     db.drop().await;
 }
