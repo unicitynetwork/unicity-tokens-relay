@@ -23,6 +23,10 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> TestDb {
+        TestDb::with_namespaces(vec!["unicity:nametag".to_owned()]).await
+    }
+
+    async fn with_namespaces(uniqueness_namespaces: Vec<String>) -> TestDb {
         let url = std::env::var("TEST_POSTGRES_URL")
             .expect("TEST_POSTGRES_URL must point at a Postgres server for these tests");
         let admin: PgConnectOptions = url.parse().unwrap();
@@ -42,7 +46,7 @@ impl TestDb {
             pool.clone(),
             metrics,
             false,
-            vec!["unicity:nametag".to_owned()],
+            uniqueness_namespaces,
         );
         repo.migrate_up().await.unwrap();
         TestDb {
@@ -406,6 +410,31 @@ async fn rehide_hides_stored_references_to_owned_nametags() {
     for e in [&owners_own, &identity] {
         assert!(!db.hidden(&e.id).await, "event {} must stay visible", e.id);
     }
+    db.drop().await;
+}
+
+/// With enforcement disabled (no configured namespaces), m010 hides nothing.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn rehide_skips_disabled_enforcement() {
+    let db = TestDb::with_namespaces(Vec::new()).await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+
+    let mut tagged = binding(&key("41"), &b, &key("b2"), None, "{}");
+    tagged.tags.push(vec!["t".to_owned(), nm.clone()]);
+    assert_eq!(db.repo.write_event(&tagged).await.unwrap(), 1);
+    sqlx::query(
+        "INSERT INTO namespace_owner (namespace, d_tag, author) VALUES ('unicity:nametag', $1, $2)",
+    )
+    .bind(&nm)
+    .bind(hex::decode(&a).unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.rerun_migration(10).await;
+    assert!(!db.hidden(&tagged.id).await);
     db.drop().await;
 }
 

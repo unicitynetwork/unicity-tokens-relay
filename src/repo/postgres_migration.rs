@@ -26,8 +26,12 @@ impl Migration for SimpleSqlMigration {
     }
 }
 
-/// Execute all migrations on the database.
-pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
+/// Execute all migrations on the database. `uniqueness_namespaces` is the
+/// configured UNIP-01 namespaces (`authorization.uniqueness_namespaces`).
+pub async fn run_migrations(
+    db: &PostgresPool,
+    uniqueness_namespaces: &[String],
+) -> crate::error::Result<usize> {
     prepare_migrations_table(db).await;
     run_migration(m001::migration(), db).await;
     let m002_result = run_migration(m002::migration(), db).await;
@@ -41,7 +45,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     m007::run(db).await?;
     run_migration(m008::migration(), db).await;
     run_migration(m009::migration(), db).await;
-    run_migration(m010::migration(), db).await;
+    run_migration(m010::migration(uniqueness_namespaces), db).await;
     Ok(current_version(db).await as usize)
 }
 
@@ -719,8 +723,10 @@ mod m010 {
 
     pub const VERSION: i64 = 10;
 
-    pub fn migration() -> impl Migration {
-        HideNametagReferences
+    pub fn migration(uniqueness_namespaces: &[String]) -> impl Migration {
+        HideNametagReferences {
+            namespaces: uniqueness_namespaces.to_vec(),
+        }
     }
 
     /// UNIP-01: hide stored kind 30078 events that refer, by d-tag or t-tag, to
@@ -729,8 +735,13 @@ mod m010 {
     /// rule to events stored before either did. Candidates are events with a
     /// d or t tag equal to an owned nametag hash and a different author;
     /// `Event::nametag_references` then decides, with its exemptions. Hidden
-    /// events stay stored and are logged by id.
-    struct HideNametagReferences;
+    /// events stay stored and are logged by id. Nothing is hidden unless
+    /// `unicity:nametag` is a configured namespace; a relay that enables it
+    /// later can re-run this migration (`DELETE FROM migrations WHERE
+    /// serial_number = 10`).
+    struct HideNametagReferences {
+        namespaces: Vec<String>,
+    }
 
     #[async_trait]
     impl Migration for HideNametagReferences {
@@ -739,7 +750,14 @@ mod m010 {
         }
 
         async fn run(&self, tx: &mut Transaction<Postgres>) {
-            let namespaces = vec![UNICITY_NAMETAG_NAMESPACE.to_owned()];
+            if !self
+                .namespaces
+                .iter()
+                .any(|ns| ns == UNICITY_NAMETAG_NAMESPACE)
+            {
+                info!("m010: {UNICITY_NAMETAG_NAMESPACE} is not enforced; nothing hidden");
+                return;
+            }
             // MATERIALIZED applies the hash-format filter before decode().
             (&mut *tx)
                 .execute(
@@ -765,7 +783,7 @@ WHERE e.kind = 30078 AND e.pub_key <> o.author AND e.hidden != 1::bit(1)"#,
                 if rows.is_empty() {
                     break;
                 }
-                hidden += hide_references_to_owned_nametags(tx, rows, &namespaces)
+                hidden += hide_references_to_owned_nametags(tx, rows, &self.namespaces)
                     .await
                     .unwrap();
             }

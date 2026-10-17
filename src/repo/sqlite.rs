@@ -369,7 +369,8 @@ impl NostrRepo for SqliteRepo {
     async fn migrate_up(&self) -> Result<usize> {
         let _write_guard = self.write_in_progress.lock().await;
         let mut conn = self.write_pool.get()?;
-        task::spawn_blocking(move || upgrade_db(&mut conn)).await?
+        let uniqueness_namespaces = self.uniqueness_namespaces.clone();
+        task::spawn_blocking(move || upgrade_db(&mut conn, &uniqueness_namespaces)).await?
     }
     /// Persist event to database
     async fn write_event(&self, e: &Event) -> Result<u64> {
@@ -1977,7 +1978,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2043,7 +2044,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let mk = |id: &str, author: &str| Event {
@@ -2113,7 +2114,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2160,7 +2161,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let attacker = "cc".repeat(32);
@@ -2198,7 +2199,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2241,7 +2242,7 @@ mod tests {
         .unwrap();
         conn.execute_batch("PRAGMA user_version = 20;").unwrap();
 
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
         for e in [&tagged, &same_d] {
             assert!(unip01_hidden(&conn, &e.id), "event {} must be hidden", e.id);
         }
@@ -2254,6 +2255,39 @@ mod tests {
         }
     }
 
+    /// With enforcement disabled (no configured namespaces), the v21 migration
+    /// hides nothing.
+    #[test]
+    fn unip01_rehide_skips_disabled_enforcement() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn, &[]).unwrap();
+
+        let nametag = "a1".repeat(32);
+        let mut tagged = unip01_binding(
+            &"41".repeat(32),
+            &"bb".repeat(32),
+            &"b2".repeat(32),
+            false,
+            "{}",
+        );
+        tagged.tags.push(vec!["t".to_owned(), nametag.clone()]);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &tagged, &[]).unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES ('unicity:nametag', ?1, ?2, 0);",
+            params![nametag, hex::decode("aa".repeat(32)).unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version = 20;").unwrap();
+
+        upgrade_db(&mut conn, &[]).unwrap();
+        assert!(!unip01_hidden(&conn, &tagged.id));
+    }
+
     /// An unmarked (legacy-format) nametag binding records its author as owner
     /// when the identifier has none, exactly as the migration backfill does for
     /// bindings stored before UNIP-01, so a later marked binding from a
@@ -2263,7 +2297,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2309,7 +2343,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2342,7 +2376,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2410,7 +2444,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let sha256_hex = |s: String| {
             use bitcoin_hashes::{sha256, Hash};
@@ -2465,7 +2499,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2503,7 +2537,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2546,7 +2580,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2587,7 +2621,7 @@ mod tests {
         .unwrap();
         assert_eq!(unip01_owner(&conn, "nm6"), None);
 
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
         assert_eq!(
             unip01_owner(&conn, "nm5"),
             Some(hex::decode(&author_a).unwrap())
@@ -2607,7 +2641,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
@@ -2638,7 +2672,7 @@ mod tests {
         .unwrap();
         assert_eq!(unip01_owner(&conn, "nm7"), None);
 
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
         assert_eq!(
             unip01_owner(&conn, "nm7"),
             Some(hex::decode(&author_a).unwrap())
@@ -2653,7 +2687,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let other = unip01_binding(
@@ -2669,7 +2703,7 @@ mod tests {
         );
         conn.execute_batch("PRAGMA user_version = 19;").unwrap();
 
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
         assert_eq!(unip01_owner(&conn, "app1"), None);
     }
 
@@ -2680,7 +2714,7 @@ mod tests {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
-        upgrade_db(&mut conn).unwrap();
+        upgrade_db(&mut conn, &["unicity:nametag".to_owned()]).unwrap();
 
         let ns = vec!["unicity:nametag".to_owned()];
         let identity = unip01_binding(
