@@ -139,8 +139,14 @@ checked: its author's identity-binding `d` tag,
 `SHA-256("unicity:address:" + s)`, of any string `s` the event carries in a tag
 or as a top-level string in its JSON content. Anyone can claim such a value as a
 nametag, so without this exception that claim would block the bindings of the
-identity or address the value belongs to. Events stored before this check
-applied are not removed by it.
+identity or address the value belongs to.
+
+The check also applies to events already stored. When a nametag gets its first
+owner, the relay MUST hide the kind `30078` events other keys stored earlier
+that the check would now reject, so a reference planted before the nametag was
+claimed does not outlive the claim. A relay that adopts the check SHOULD apply
+it once to the events it already stores. Hidden events are kept but not served,
+so hiding can be reversed.
 
 A relay that ran the backfill before recording legacy bindings on ingest SHOULD
 run it again; since it only fills `(namespace, d-tag)` pairs that have no owner,

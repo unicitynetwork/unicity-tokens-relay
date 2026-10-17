@@ -2,6 +2,7 @@
 use crate::db::PooledConnection;
 use crate::error::Result;
 use crate::event::{single_char_tagname, Event, UNICITY_NAMETAG_NAMESPACE};
+use crate::repo::sqlite::hide_references_to_owned_nametags;
 use crate::utils::is_lower_hex;
 use const_format::formatcp;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,7 +24,7 @@ pragma mmap_size = 0; -- disable mmap (default)
 "##;
 
 /// Latest database version
-pub const DB_VERSION: usize = 20;
+pub const DB_VERSION: usize = 21;
 
 /// Schema definition
 const INIT_SQL: &str = formatcp!(
@@ -260,6 +261,9 @@ pub fn upgrade_db(conn: &mut PooledConnection) -> Result<usize> {
             }
             if curr_version == 19 {
                 curr_version = mig_19_to_20(conn)?;
+            }
+            if curr_version == 20 {
+                curr_version = mig_20_to_21(conn)?;
             }
 
             if curr_version == DB_VERSION {
@@ -943,4 +947,36 @@ fn mig_19_to_20(conn: &mut PooledConnection) -> Result<usize> {
         start.elapsed()
     );
     Ok(20)
+}
+
+fn mig_20_to_21(conn: &mut PooledConnection) -> Result<usize> {
+    info!("database schema needs update from 20->21");
+    // UNIP-01: hide stored kind 30078 events that refer, by d-tag or t-tag, to
+    // a nametag owned by another key. Ingest rejects such events, and hides
+    // earlier ones when a nametag gets its first owner; this applies the same
+    // rule to events stored before either did. Candidates are events with a d
+    // or t tag equal to an owned nametag hash and a different author;
+    // Event::nametag_references then decides, with its exemptions. Hidden
+    // events stay stored and are logged by id.
+    let start = Instant::now();
+    let namespaces = vec![UNICITY_NAMETAG_NAMESPACE.to_owned()];
+    let tx = conn.transaction()?;
+    let candidates: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT e.id, e.content FROM namespace_owner o \
+             INNER JOIN tag t ON t.name IN ('d', 't') AND t.kind = 30078 AND t.value = o.d_tag \
+             INNER JOIN event e ON e.id = t.event_id \
+             WHERE o.namespace = 'unicity:nametag' AND length(o.d_tag) = 64 AND e.author != o.author AND e.hidden != TRUE;",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let hidden = hide_references_to_owned_nametags(&tx, candidates, &namespaces)?;
+    tx.execute("PRAGMA user_version = 21;", [])?;
+    tx.commit()?;
+    info!(
+        "database schema upgraded v20 -> v21 ({hidden} events referring to nametags owned by another key hidden) in {:?}",
+        start.elapsed()
+    );
+    Ok(21)
 }
