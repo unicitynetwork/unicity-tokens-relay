@@ -960,7 +960,10 @@ fn mig_20_to_21(conn: &mut PooledConnection, uniqueness_namespaces: &[String]) -
     // or t tag equal to an owned nametag hash and a different author;
     // Event::nametag_references then decides, with its exemptions. Hidden
     // events stay stored and are logged by id. Nothing is hidden unless
-    // unicity:nametag is a configured namespace.
+    // unicity:nametag is a configured namespace; the version still advances,
+    // since holding it at 20 would also hold back every later migration. A
+    // relay that enables the namespace later can re-run this one by setting
+    // `PRAGMA user_version = 20` and restarting.
     let start = Instant::now();
     let tx = conn.transaction()?;
     let enforced = uniqueness_namespaces

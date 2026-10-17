@@ -25,6 +25,12 @@ use tracing::{debug, error, info, trace, warn};
 
 pub type PostgresPool = sqlx::pool::Pool<Postgres>;
 
+/// Transaction-level advisory lock taken by every write that claims a
+/// `unicity:nametag` identifier or refers to one, so that across relay
+/// instances a nametag's first claim and a concurrent reference to it cannot
+/// miss each other's uncommitted rows. ASCII bytes for `unip01nt`.
+pub(crate) const NAMETAG_LOCK_KEY: i64 = 0x756e_6970_3031_6e74_i64;
+
 pub struct PostgresRepo {
     conn: PostgresPool,
     conn_write: PostgresPool,
@@ -150,6 +156,18 @@ impl NostrRepo for PostgresRepo {
         // self-asserted created_at. The upsert + re-select run in this
         // transaction so concurrent first-claims serialize on the primary key.
         // `new_nametag` is set when this event records a nametag's first owner.
+        let references = e.nametag_references(&self.uniqueness_namespaces);
+        let nametag_claim = e
+            .legacy_nametag_claim(&self.uniqueness_namespaces)
+            .is_some()
+            || matches!(e.uniqueness_claim(&self.uniqueness_namespaces),
+                        Some((namespace, _)) if namespace == UNICITY_NAMETAG_NAMESPACE);
+        if nametag_claim || !references.is_empty() {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(NAMETAG_LOCK_KEY)
+                .execute(&mut tx)
+                .await?;
+        }
         let mut new_nametag: Option<String> = None;
         if let Some((namespace, d_tag)) = e.uniqueness_claim(&self.uniqueness_namespaces) {
             let inserted = sqlx::query(
@@ -198,7 +216,7 @@ impl NostrRepo for PostgresRepo {
         // t-tag, only if its author owns that nametag or nobody does. A
         // binding's own d-tag was recorded above, so this also rejects a legacy
         // binding from a non-owner.
-        if refers_to_others_nametag(&mut tx, e, &self.uniqueness_namespaces).await? {
+        if owned_by_others(&mut tx, &references, &e.pubkey).await? {
             return Err(error::Error::EventBlocked(
                 "nametag is owned by another key".to_owned(),
             ));
@@ -941,6 +959,27 @@ LIMIT 1;
 }
 
 /// Create a dynamic SQL query and params from a subscription filter.
+/// UNIP-01: whether any of the nametag hashes `references` is owned by a key
+/// other than `author` (hex).
+async fn owned_by_others(
+    tx: &mut Transaction<'_, Postgres>,
+    references: &[String],
+    author: &str,
+) -> Result<bool> {
+    if references.is_empty() {
+        return Ok(false);
+    }
+    let author = hex::decode(author).ok();
+    let owners: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag = ANY($2);",
+    )
+    .bind(UNICITY_NAMETAG_NAMESPACE)
+    .bind(references)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(owners.iter().any(|owner| Some(owner) != author.as_ref()))
+}
+
 /// UNIP-01: whether `e` refers, by its d-tag or a t-tag, to a nametag owned by
 /// a key other than its author (see `Event::nametag_references`).
 async fn refers_to_others_nametag(
@@ -948,19 +987,7 @@ async fn refers_to_others_nametag(
     e: &Event,
     namespaces: &[String],
 ) -> Result<bool> {
-    let references = e.nametag_references(namespaces);
-    if references.is_empty() {
-        return Ok(false);
-    }
-    let author = hex::decode(&e.pubkey).ok();
-    let owners: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT author FROM namespace_owner WHERE namespace=$1 AND d_tag = ANY($2);",
-    )
-    .bind(UNICITY_NAMETAG_NAMESPACE)
-    .bind(&references)
-    .fetch_all(&mut *tx)
-    .await?;
-    Ok(owners.iter().any(|owner| Some(owner) != author.as_ref()))
+    owned_by_others(tx, &e.nametag_references(namespaces), &e.pubkey).await
 }
 
 /// UNIP-01: hide each candidate, given as (event id, stored event JSON), that

@@ -7,6 +7,7 @@
 
 use crate::error::Error;
 use crate::event::Event;
+use crate::repo::postgres::NAMETAG_LOCK_KEY;
 use crate::repo::postgres::{PostgresPool, PostgresRepo};
 use crate::repo::NostrRepo;
 use crate::server::create_metrics;
@@ -435,6 +436,38 @@ async fn rehide_skips_disabled_enforcement() {
 
     db.rerun_migration(10).await;
     assert!(!db.hidden(&tagged.id).await);
+    db.drop().await;
+}
+
+/// A nametag claim and an event referring to a nametag wait for the nametag
+/// lock, which serializes them across relay instances; other app data does not.
+#[tokio::test]
+#[ignore = "needs Postgres: set TEST_POSTGRES_URL"]
+async fn nametag_writes_take_the_nametag_lock() {
+    let db = TestDb::new().await;
+    let (a, b) = (key("aa"), key("bb"));
+    let nm = key("a1");
+    let claim = binding(&key("51"), &a, &nm, MARKED, &nametag_content(&nm));
+    let mut reference = binding(&key("52"), &b, &key("b2"), None, "{}");
+    reference.tags.push(vec!["t".to_owned(), key("c3")]);
+    let unrelated = binding(&key("53"), &b, "settings", None, "{}");
+
+    for (e, waits) in [(&claim, true), (&reference, true), (&unrelated, false)] {
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(NAMETAG_LOCK_KEY)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let write = db.repo.write_event(e);
+        tokio::pin!(write);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut write).await;
+        assert_eq!(early.is_err(), waits, "event {}", e.id);
+        holder.commit().await.unwrap();
+        if waits {
+            assert_eq!(write.await.unwrap(), 1);
+        }
+    }
     db.drop().await;
 }
 
