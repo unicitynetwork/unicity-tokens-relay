@@ -3,7 +3,7 @@
 use crate::config::Settings;
 use crate::db::{QueryResult, SLOW_THRESHOLD};
 use crate::error::{Error::SqlError, Result};
-use crate::event::{single_char_tagname, Event};
+use crate::event::{single_char_tagname, Event, UNICITY_NAMETAG_NAMESPACE};
 use crate::nip05::{Nip05Name, VerificationRecord};
 use crate::payment::{InvoiceInfo, InvoiceStatus};
 use crate::repo::sqlite_migration::{upgrade_db, STARTUP_SQL};
@@ -18,6 +18,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::types::ToSql;
 use rusqlite::OpenFlags;
+use rusqlite::OptionalExtension;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -185,6 +186,24 @@ impl SqliteRepo {
                 "INSERT OR IGNORE INTO namespace_owner (namespace, d_tag, author, first_seen) VALUES (?1, ?2, ?3, strftime('%s','now'));",
                 params![namespace, d_tag, pubkey_blob],
             )?;
+        }
+        // A kind 30078 event may refer to a nametag hash, by its d-tag or a
+        // t-tag, only if its author owns that nametag or nobody does. A
+        // binding's own d-tag was recorded above, so this also rejects a legacy
+        // binding from a non-owner.
+        for reference in e.nametag_references(uniqueness_namespaces) {
+            let owner: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT author FROM namespace_owner WHERE namespace=?1 AND d_tag=?2;",
+                    params![UNICITY_NAMETAG_NAMESPACE, reference],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if owner.is_some() && owner != pubkey_blob {
+                return Err(crate::error::Error::EventBlocked(
+                    "nametag is owned by another key".to_owned(),
+                ));
+            }
         }
         // check for replaceable events that would hide this one; we won't even attempt to insert these.
         if e.is_replaceable() {
@@ -2038,10 +2057,10 @@ mod tests {
         );
     }
 
-    /// A legacy binding never replaces a recorded owner, and is itself still
-    /// stored: enforcement stays opt-in via the marker.
+    /// A legacy binding never replaces a recorded owner: one from a different
+    /// author is rejected like a marked one.
     #[test]
-    fn unip01_legacy_binding_keeps_existing_owner() {
+    fn unip01_legacy_binding_from_non_owner_is_rejected() {
         let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         let mut conn = pool.get().unwrap();
@@ -2050,23 +2069,189 @@ mod tests {
         let ns = vec!["unicity:nametag".to_owned()];
         let author_a = "aa".repeat(32);
         let author_b = "bb".repeat(32);
-        let content = "{\"nametag_hash\":\"nm4\"}";
+        let nametag = "a4".repeat(32);
+        let content = format!("{{\"nametag_hash\":\"{nametag}\"}}");
 
-        let marked_a = unip01_binding(&"99".repeat(32), &author_a, "nm4", true, content);
+        let marked_a = unip01_binding(&"99".repeat(32), &author_a, &nametag, true, &content);
         assert_eq!(
             SqliteRepo::persist_event(&mut conn, &marked_a, &ns).unwrap(),
             1
         );
 
-        let legacy_b = unip01_binding(&"aa".repeat(32), &author_b, "nm4", false, content);
+        let legacy_b = unip01_binding(&"aa".repeat(32), &author_b, &nametag, false, &content);
+        assert!(matches!(
+            SqliteRepo::persist_event(&mut conn, &legacy_b, &ns),
+            Err(crate::error::Error::EventBlocked(_))
+        ));
         assert_eq!(
-            SqliteRepo::persist_event(&mut conn, &legacy_b, &ns).unwrap(),
+            unip01_owner(&conn, &nametag),
+            Some(hex::decode(&author_a).unwrap())
+        );
+    }
+
+    /// Only the owner of a nametag may refer to its hash from a kind-30078
+    /// event, by `d` tag or `t` tag, whatever else the event carries:
+    /// resolvers fetch bindings by `#t` and match the `d` tag.
+    #[test]
+    fn unip01_other_authors_cannot_refer_to_owned_nametag() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let nametag = "a1".repeat(32);
+        let content = format!("{{\"nametag_hash\":\"{nametag}\"}}");
+        let t_tag = vec!["t".to_owned(), nametag.clone()];
+
+        let owner = unip01_binding(&"11".repeat(32), &author_a, &nametag, true, &content);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &owner, &ns).unwrap(),
+            1
+        );
+
+        // B's marked binding for its own nametag, also tagged with A's.
+        let other_nametag = "b2".repeat(32);
+        let mut marked_t = unip01_binding(&"12".repeat(32), &author_b, &other_nametag, true, "{}");
+        marked_t.tags.push(t_tag.clone());
+        let mut unmarked_t =
+            unip01_binding(&"13".repeat(32), &author_b, &"c3".repeat(32), false, "{}");
+        unmarked_t.tags.push(t_tag.clone());
+        let not_a_binding = unip01_binding(&"14".repeat(32), &author_b, &nametag, false, "x");
+        let mut other_label =
+            unip01_binding(&"15".repeat(32), &author_b, &nametag, false, &content);
+        other_label
+            .tags
+            .push(vec!["L".to_owned(), "other:ns".to_owned()]);
+        for e in [&marked_t, &unmarked_t, &not_a_binding, &other_label] {
+            assert!(
+                matches!(
+                    SqliteRepo::persist_event(&mut conn, e, &ns),
+                    Err(crate::error::Error::EventBlocked(_))
+                ),
+                "event {} must be blocked",
+                e.id
+            );
+        }
+        // The rejected marked binding recorded no owner for B's nametag.
+        assert_eq!(unip01_owner(&conn, &other_nametag), None);
+
+        // The owner may refer to its nametag from other events.
+        let mut identity = unip01_binding(
+            &"16".repeat(32),
+            &author_a,
+            &"d4".repeat(32),
+            false,
+            "{\"public_key\":\"02ab\"}",
+        );
+        identity.tags.push(t_tag);
+        assert_eq!(
+            SqliteRepo::persist_event(&mut conn, &identity, &ns).unwrap(),
             1
         );
         assert_eq!(
-            unip01_owner(&conn, "nm4"),
+            unip01_owner(&conn, &nametag),
             Some(hex::decode(&author_a).unwrap())
         );
+    }
+
+    /// A key that claims a victim's address hash or identity-binding d-tag as
+    /// a nametag does not block the victim's bindings, which carry the address
+    /// and are authored by the identity's key.
+    #[test]
+    fn unip01_claimed_address_and_identity_hashes_do_not_block_their_owner() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let sha256_hex = |s: String| {
+            use bitcoin_hashes::{sha256, Hash};
+            format!("{:x}", sha256::Hash::hash(s.as_bytes()))
+        };
+        let ns = vec!["unicity:nametag".to_owned()];
+        let attacker = "cc".repeat(32);
+        let victim = "dd".repeat(32);
+        let address_hash = sha256_hex("unicity:address:DIRECT://v".to_owned());
+        let identity_d = sha256_hex(format!("unicity:identity:{victim}"));
+
+        let claim_address = unip01_binding(&"31".repeat(32), &attacker, &address_hash, true, "{}");
+        let claim_identity = unip01_binding(&"32".repeat(32), &attacker, &identity_d, true, "{}");
+        for e in [&claim_address, &claim_identity] {
+            assert_eq!(SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(), 1);
+        }
+
+        let mut identity = unip01_binding(
+            &"33".repeat(32),
+            &victim,
+            &identity_d,
+            false,
+            "{\"direct_address\":\"DIRECT://v\"}",
+        );
+        identity
+            .tags
+            .push(vec!["t".to_owned(), address_hash.clone()]);
+        let nametag = "a5".repeat(32);
+        let mut binding = unip01_binding(
+            &"34".repeat(32),
+            &victim,
+            &nametag,
+            true,
+            &format!("{{\"nametag_hash\":\"{nametag}\",\"address\":\"DIRECT://v\"}}"),
+        );
+        binding.tags.push(vec!["t".to_owned(), nametag.clone()]);
+        binding.tags.push(vec!["t".to_owned(), address_hash]);
+        for e in [&identity, &binding] {
+            assert_eq!(
+                SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(),
+                1,
+                "event {} must be stored",
+                e.id
+            );
+        }
+    }
+
+    /// References are checked only for owned identifiers in the nametag hash
+    /// format, and only on kind-30078 events.
+    #[test]
+    fn unip01_unowned_and_non_hash_references_are_not_enforced() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        upgrade_db(&mut conn).unwrap();
+
+        let ns = vec!["unicity:nametag".to_owned()];
+        let author_a = "aa".repeat(32);
+        let author_b = "bb".repeat(32);
+        let nametag = "a1".repeat(32);
+
+        let plain = unip01_binding(&"21".repeat(32), &author_a, "settings", true, "{}");
+        let owner = unip01_binding(&"22".repeat(32), &author_a, &nametag, true, "{}");
+        for e in [&plain, &owner] {
+            assert_eq!(SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(), 1);
+        }
+
+        let mut same_plain_tags =
+            unip01_binding(&"23".repeat(32), &author_b, "settings", false, "{}");
+        same_plain_tags
+            .tags
+            .push(vec!["t".to_owned(), "settings".to_owned()]);
+        let mut unowned_t =
+            unip01_binding(&"24".repeat(32), &author_b, &"e5".repeat(32), false, "{}");
+        unowned_t.tags.push(vec!["t".to_owned(), "f6".repeat(32)]);
+        let mut note = unip01_binding(&"25".repeat(32), &author_b, "x", false, "hi");
+        note.kind = 1;
+        note.tags.push(vec!["t".to_owned(), nametag.clone()]);
+        for e in [&same_plain_tags, &unowned_t, &note] {
+            assert_eq!(
+                SqliteRepo::persist_event(&mut conn, e, &ns).unwrap(),
+                1,
+                "event {} must be stored",
+                e.id
+            );
+        }
     }
 
     /// Legacy bindings stored while the relay recorded no runtime ownership for

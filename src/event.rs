@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::event::EventWrapper::WrappedAuth;
 use crate::event::EventWrapper::WrappedEvent;
 use crate::nip05;
-use crate::utils::unix_time;
+use crate::utils::{is_lower_hex, unix_time};
 use bitcoin_hashes::{sha256, Hash};
 use lazy_static::lazy_static;
 use secp256k1::{schnorr, Secp256k1, VerifyOnly, XOnlyPublicKey};
@@ -391,6 +391,57 @@ impl Event {
         let content: Value = serde_json::from_str(&self.content).ok()?;
         content.get("nametag_hash")?;
         Some((UNICITY_NAMETAG_NAMESPACE.to_owned(), self.distinct_param()?))
+    }
+
+    /// UNIP-01: the nametag hashes this event refers to by its `d` tag or a `t`
+    /// tag, when it is a kind 30078 event and `unicity:nametag` is a configured
+    /// namespace. Nametag resolvers fetch bindings with a `#t` filter on the
+    /// hash and match the `d` tag, so the relay lets only a nametag's owner
+    /// refer to it this way. Sorted and deduplicated.
+    ///
+    /// Only values in the nametag hash format (64 lowercase hex characters)
+    /// are returned, so an identifier claimed in the namespace cannot block
+    /// application data that uses the same plain-text tag. Values the event
+    /// itself shows are something else are skipped: its author's identity
+    /// binding `d` tag, `SHA-256("unicity:identity:" + pubkey)`, and the
+    /// address hash, `SHA-256("unicity:address:" + s)`, of any string `s` it
+    /// carries in a tag or as a top-level string in its JSON content. A key
+    /// that claims such a value as a nametag therefore cannot block the
+    /// bindings of the identity or address it belongs to.
+    #[must_use]
+    pub fn nametag_references(&self, namespaces: &[String]) -> Vec<String> {
+        if self.kind != 30078 || !namespaces.iter().any(|ns| ns == UNICITY_NAMETAG_NAMESPACE) {
+            return Vec::new();
+        }
+        let mut references: Vec<String> = self
+            .distinct_param()
+            .into_iter()
+            .chain(self.tag_values_by_name("t"))
+            .filter(|value| value.len() == 64 && is_lower_hex(value))
+            .collect();
+        if references.is_empty() {
+            return references;
+        }
+        let sha256_hex = |input: String| format!("{:x}", sha256::Hash::hash(input.as_bytes()));
+        let content_strings: Vec<String> = match serde_json::from_str::<Value>(&self.content) {
+            Ok(Value::Object(fields)) => fields
+                .values()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut not_nametags: HashSet<String> = self
+            .tags
+            .iter()
+            .flat_map(|tag| tag.iter().skip(1).cloned())
+            .chain(content_strings)
+            .map(|s| sha256_hex(format!("unicity:address:{s}")))
+            .collect();
+        not_nametags.insert(sha256_hex(format!("unicity:identity:{}", self.pubkey)));
+        references.retain(|value| !not_nametags.contains(value));
+        references.sort();
+        references.dedup();
+        references
     }
 
     /// Check if this event has a valid signature.
@@ -977,6 +1028,98 @@ mod tests {
         assert_eq!(event.legacy_nametag_claim(&[]), None);
         let other = vec!["other:ns".to_owned()];
         assert_eq!(event.legacy_nametag_claim(&other), None);
+    }
+
+    // ---- UNIP-01: nametag_references ----
+
+    fn app_data_event(tags: &[(&str, &str)]) -> Event {
+        let mut event = Event::simple_event();
+        event.kind = 30078;
+        event.tags = tags
+            .iter()
+            .map(|(name, value)| vec![(*name).to_owned(), (*value).to_owned()])
+            .collect();
+        event
+    }
+
+    #[test]
+    fn nametag_references_collects_hash_d_and_t_tags() {
+        let (h1, h2) = ("a1".repeat(32), "b2".repeat(32));
+        let event = app_data_event(&[
+            ("d", &h1),
+            ("t", &h2),
+            ("t", &h1),
+            ("nametag", &"c3".repeat(32)),
+        ]);
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert_eq!(event.nametag_references(&ns), vec![h1, h2]);
+    }
+
+    #[test]
+    fn nametag_references_skip_values_not_in_hash_format() {
+        let event = app_data_event(&[
+            ("d", "settings"),
+            ("t", "pact"),
+            ("t", &"A1".repeat(32)),
+            ("t", &"a1".repeat(31)),
+            ("t", ""),
+        ]);
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert!(event.nametag_references(&ns).is_empty());
+    }
+
+    #[test]
+    fn nametag_references_require_app_data_kind() {
+        let h = "a1".repeat(32);
+        let mut event = app_data_event(&[("d", &h), ("t", &h)]);
+        let ns = vec!["unicity:nametag".to_owned()];
+        for kind in [1, 30001] {
+            event.kind = kind;
+            assert!(event.nametag_references(&ns).is_empty(), "kind {kind}");
+        }
+    }
+
+    fn sha256_hex_of(input: &str) -> String {
+        format!("{:x}", sha256::Hash::hash(input.as_bytes()))
+    }
+
+    #[test]
+    fn nametag_references_skip_own_identity_d_tag() {
+        let mut event = app_data_event(&[]);
+        let identity_d = sha256_hex_of(&format!("unicity:identity:{}", event.pubkey));
+        event.tags = vec![vec!["d".to_owned(), identity_d]];
+        let ns = vec!["unicity:nametag".to_owned()];
+        assert!(event.nametag_references(&ns).is_empty());
+    }
+
+    #[test]
+    fn nametag_references_skip_hashes_of_carried_addresses() {
+        let address = |a: &str| sha256_hex_of(&format!("unicity:address:{a}"));
+        let nametag = "a1".repeat(32);
+        let mut event = app_data_event(&[
+            ("d", &nametag),
+            ("t", &nametag),
+            ("address", "DIRECT://x"),
+            ("t", &address("DIRECT://x")),
+            ("t", &address("02ab")),
+            ("t", &address("DIRECT://y")),
+            ("t", &address("DIRECT://not-carried")),
+        ]);
+        event.content = r#"{"public_key":"02ab","direct_address":"DIRECT://y","n":1}"#.to_owned();
+        let ns = vec!["unicity:nametag".to_owned()];
+        let mut expected = vec![nametag, address("DIRECT://not-carried")];
+        expected.sort();
+        assert_eq!(event.nametag_references(&ns), expected);
+    }
+
+    #[test]
+    fn nametag_references_require_configured_namespace() {
+        let h = "a1".repeat(32);
+        let event = app_data_event(&[("d", &h), ("t", &h)]);
+        assert!(event.nametag_references(&[]).is_empty());
+        assert!(event
+            .nametag_references(&["other:ns".to_owned()])
+            .is_empty());
     }
 
     // ---- UNIP-01: is_valid_timestamp past/future bounds ----

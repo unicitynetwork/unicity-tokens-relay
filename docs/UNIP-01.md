@@ -50,7 +50,7 @@ An identity binding that opts into UNIP-01 MUST include:
 Relays maintain a configurable allowlist of UNIP-01 namespaces
 (`authorization.uniqueness_namespaces`). Events that do not carry a configured
 namespace marker are handled by normal Nostr/NIP-33 rules; apart from the
-legacy ownership recording in §7, they are unaffected by UNIP-01. Gating on the
+`unicity:nametag` rules in §7, they are unaffected by UNIP-01. Gating on the
 marker (rather than on `kind` alone) keeps shared kinds such as `30078` usable
 by unrelated applications.
 
@@ -116,14 +116,31 @@ author with the minimum `first_seen` among existing matching events. Because
 `first_seen` is the relay's own receive time (not a self-asserted value), this
 preserves the earliest genuine claim the relay observed.
 
-Publishers that predate UNIP-01 keep emitting bindings without the marker.
-Such legacy bindings are accepted as before (the acceptance rule in §3 applies
-only to marked events), but on ingest the relay MUST record the author of a
-legacy binding as owner of its `(namespace, d-tag)` when no owner is recorded
-yet, exactly as the backfill would have. An identifier first published in the
-legacy format is thereby owned by its publisher, whether it arrived before or
-after the backfill. For `unicity:nametag`, a legacy binding is a kind `30078`
-event with no NIP-32 `L` label whose JSON content has a `nametag_hash` field.
+Publishers that predate UNIP-01 keep emitting bindings without the marker. On
+ingest of such a legacy binding the relay MUST record its author as owner of its
+`(namespace, d-tag)` when no owner is recorded yet, exactly as the backfill
+would have. An identifier first published in the legacy format is thereby owned
+by its publisher, whether it arrived before or after the backfill. For
+`unicity:nametag`, a legacy binding is a kind `30078` event with no NIP-32 `L`
+label whose JSON content has a `nametag_hash` field.
+
+Clients find a nametag's bindings with a `#t` filter on its hash. Older
+clients count every event that filter returns, and current clients count every
+kind `30078` event whose `d` tag is the hash, marked or not. For
+`unicity:nametag` the relay therefore MUST also reject a kind `30078` event
+whose `d` tag or any `t` tag is the hash of a nametag owned by another key,
+whether or not the event carries the marker or is a binding at all; a legacy
+binding from a non-owner is rejected this way. Only values in the nametag hash
+format (64 lowercase hexadecimal characters) are checked, so an identifier
+claimed in the namespace cannot block unrelated application data that uses the
+same plain-text tag. Values the event itself shows to be something else are not
+checked: its author's identity-binding `d` tag,
+`SHA-256("unicity:identity:" + pubkey)`, and the address hash,
+`SHA-256("unicity:address:" + s)`, of any string `s` the event carries in a tag
+or as a top-level string in its JSON content. Anyone can claim such a value as a
+nametag, so without this exception that claim would block the bindings of the
+identity or address the value belongs to. Events stored before this check
+applied are not removed by it.
 
 A relay that ran the backfill before recording legacy bindings on ingest SHOULD
 run it again; since it only fills `(namespace, d-tag)` pairs that have no owner,
